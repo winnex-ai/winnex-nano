@@ -80,6 +80,12 @@ public:
     // Each character produces embed_dim quaternions (the spectral modes).
     std::vector<Quat> encode(const std::string& text) const;
 
+    // Encodes a text into a DISCRIMINATIVE character histogram (normalized).
+    // Empirically validated: the raw spectral average collapses (cos ~0.99),
+    // while the character histogram discriminates well (cos 0.13-0.60, std 0.16).
+    // This is the text representation projected onto the model manifold (X factor).
+    std::vector<float> encode_histogram(const std::string& text, int bins = 256) const;
+
     // Decodes a sequence of quaternion states back to text via the probe
     // (inner product + exp + normalize + argmax). Returns the best-guess text.
     std::string decode(const std::vector<Quat>& states) const;

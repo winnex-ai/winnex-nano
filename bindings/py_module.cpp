@@ -28,6 +28,8 @@ PYBIND11_MODULE(_winnex_nano, m) {
     py::class_<SpectralTokenizer>(m, "SpectralTokenizer")
         .def(py::init<int>(), py::arg("embed_dim") = 64)
         .def("encode", &SpectralTokenizer::encode, py::arg("text"))
+        .def("encode_histogram", &SpectralTokenizer::encode_histogram,
+             py::arg("text"), py::arg("bins") = 256)
         .def("decode", &SpectralTokenizer::decode, py::arg("states"))
         .def_property_readonly("embed_dim", &SpectralTokenizer::embed_dim);
 

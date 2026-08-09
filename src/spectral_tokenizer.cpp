@@ -39,6 +39,20 @@ std::vector<Quat> SpectralTokenizer::encode(const std::string& text) const {
     return states;
 }
 
+std::vector<float> SpectralTokenizer::encode_histogram(const std::string& text, int bins) const {
+    std::vector<float> hist(bins, 0.0f);
+    for (char ch : text) {
+        int idx = static_cast<unsigned char>(ch) % bins;
+        hist[idx] += 1.0f;
+    }
+    // L2 normalize (deterministic, scale-free).
+    float norm = 0.0f;
+    for (auto v : hist) norm += v * v;
+    norm = std::sqrt(norm) + 1e-9f;
+    for (auto& v : hist) v /= norm;
+    return hist;
+}
+
 std::string SpectralTokenizer::decode(const std::vector<Quat>& states) const {
     if (states.empty()) return "";
     const size_t n_chars = states.size() / static_cast<size_t>(embed_dim_);
