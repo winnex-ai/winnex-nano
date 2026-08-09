@@ -1,11 +1,12 @@
 // stream_engine.cpp — Winnex-Nano streaming engine (chunk via fast build).
 #include "winnex_nano/stream_engine.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <memory>
 #include <numeric>
-#include <chrono>
 
 #include "winnex_madhava/winnex_madhava.hpp"
 

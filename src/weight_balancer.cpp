@@ -1,6 +1,7 @@
 // weight_balancer.cpp — multimodel weight blending (PsiQRH-derived).
 #include "winnex_nano/weight_balancer.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
