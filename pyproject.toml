@@ -1,0 +1,66 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12", "cmake>=3.20", "auditwheel>=5.0", "numpy>=1.20"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "winnex-nano"
+version = "0.1.0"
+description = "Native Winnex inference engine — deterministic spectral tokenizer, multimodel weight balancing, and chunk streaming via the Madhava fast build. Model-agnostic (Qwen/BERT/DeepSeek/GPT), OpenCL, no CUDA."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Winnex Brasil Soluções Empresariais LTDA-ME", email = "pay@winnex.ai" },
+]
+keywords = [
+    "inference", "llm", "spectral", "tokenizer", "quaternion", "multimodel",
+    "weight-balancing", "streaming", "sse", "madhava", "deterministic",
+    "opencl", "winnex", "softmax-free",
+]
+classifiers = [
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "winnex-madhava>=1.8.1",   # the Madhava engine (fast build + bound kernels)
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+server = ["fastapi>=0.100", "uvicorn>=0.20", "httpx>=0.27"]
+bench = ["transformers>=4.40"]
+
+[project.urls]
+Homepage = "https://winnex.ai"
+Source = "https://github.com/winnex-ai"
+Zenodo = "https://zenodo.org/records/21861809"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+cmake.version = ">=3.20"
+wheel.packages = ["python/winnex_nano"]
+sdist.include = [
+    "include/**",
+    "src/**",
+    "bindings/**",
+    "CMakeLists.txt",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+    "benchmark_honesto.py",
+    "server_sse.py",
+]
+
+[tool.scikit-build.cmake.define]
+MADHAVA_BUILD_TESTS = "OFF"
+MADHAVA_BUILD_BENCHMARK = "OFF"
+MADHAVA_BUILD_EXAMPLES = "OFF"
+WINNEX_NANO_BUILD_TESTS = "OFF"
+
+[tool.setuptools]
+package-dir = { "" = "python" }

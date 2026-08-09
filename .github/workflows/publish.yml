@@ -1,0 +1,61 @@
+name: publish
+
+# Publish winnex-nano to PyPI using a Trusted Publisher (OpenID Connect).
+# This is the credential-free mechanism recommended by PyPI — no API token
+# needed. The PyPI-side configuration must match EXACTLY:
+#
+#   PyPI Project Name : winnex-nano
+#   Owner             : winnex-ai
+#   Repository name   : winnex-nano
+#   Workflow name     : publish.yml
+#   Environment name  : publish
+#
+# The wheel is built inside the official PyPA manylinux Docker image so it
+# carries a broad manylinux platform tag (not a host-specific linux_x86_64).
+
+on:
+  push:
+    tags:
+      - "v*"          # v0.1.0, v0.1.1, ... trigger a release
+  workflow_dispatch:  # allow manual trigger from the Actions tab
+
+permissions:
+  contents: read
+  id-token: write    # required for the trusted-publisher OIDC exchange
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64   # manylinux toolchain
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # winnex-nano reuses the winnex-madhava C++ sources at build time;
+          # check them out alongside so the CMake can reference them.
+          path: winnex-nano
+
+      - name: Checkout winnex-madhava (kernel dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: winnex-ai/winnex-madhava
+          path: winnex-madhava
+
+      - name: Build sdist and wheel (manylinux container)
+        run: |
+          PY=/opt/python/cp312-cp312/bin/python
+          $PY -m pip install --quiet build pybind11 cmake
+          cd winnex-nano
+          $PY -m build
+
+      - name: Repair wheel to manylinux (auditwheel)
+        run: |
+          PY=/opt/python/cp312-cp312/bin/python
+          cd winnex-nano
+          $PY -m pip install --quiet auditwheel
+          auditwheel repair dist/*.whl -w dist/repair --plat manylinux_2_28_x86_64
+
+      - name: Publish to PyPI (Trusted Publisher / OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: winnex-nano/dist/repair/
+          environment: publish
