@@ -24,3 +24,4 @@ __pycache__/
 .pypirc
 credentials.json
 secrets.json
+.winnex_nano_deposit_id
