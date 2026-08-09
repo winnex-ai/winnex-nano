@@ -23,7 +23,7 @@ from ._winnex_nano import (
     StreamChunk,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.7"
 
 __all__ = [
     "Quat",
