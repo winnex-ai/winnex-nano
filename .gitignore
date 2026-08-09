@@ -1,3 +1,4 @@
+# Build artifacts
 build/
 dist/
 *.egg-info/
@@ -5,3 +6,21 @@ __pycache__/
 *.so
 *.o
 *.a
+*.pyc
+
+# Documentation (only README.md is tracked; analysis/status/prepatent stay local)
+*.md
+!README.md
+
+# Secrets — never commit tokens, passwords, or keys
+.env
+.env.*
+!.env.example
+*.token
+*_token*
+*.key
+*.pem
+.git-credentials
+.pypirc
+credentials.json
+secrets.json
