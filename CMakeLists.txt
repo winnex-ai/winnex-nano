@@ -60,20 +60,13 @@ target_include_directories(winnex_nano PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_link_libraries(winnex_nano PUBLIC madhava_reused)
 
 # --- Python bindings (pybind11) --------------------------------------------
-find_package(Python3 COMPONENTS Interpreter Development)
-if(Python3_FOUND)
-    find_package(pybind11 CONFIG QUIET)
-    if(NOT pybind11_FOUND)
-        include(FetchContent)
-        FetchContent_Declare(pybind11
-            GIT_REPOSITORY https://github.com/pybind/pybind11.git
-            GIT_TAG v2.12.0)
-        FetchContent_MakeAvailable(pybind11)
-    endif()
-    pybind11_add_module(_winnex_nano bindings/py_module.cpp)
-    target_link_libraries(_winnex_nano PRIVATE winnex_nano)
-    install(TARGETS _winnex_nano DESTINATION ${SKBUILD_PLATLIB_DIR})
-endif()
+# scikit-build-core sets up Python3_ROOT_DIR / Python_EXECUTABLE in the build
+# environment; pybind11's pybind11_add_module resolves the interpreter without
+# us requiring Development/Development.Embed (which manylinux lacks).
+find_package(pybind11 CONFIG REQUIRED)
+pybind11_add_module(_winnex_nano bindings/py_module.cpp)
+target_link_libraries(_winnex_nano PRIVATE winnex_nano)
+install(TARGETS _winnex_nano DESTINATION ${SKBUILD_PLATLIB_DIR})
 
 # --- Tests -----------------------------------------------------------------
 enable_testing()
