@@ -56,6 +56,7 @@ add_library(winnex_nano
     src/tensor_ops.cpp
     src/stream_engine.cpp
     src/x_factor.cpp
+    src/safetensors.cpp
 )
 target_include_directories(winnex_nano PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(winnex_nano PUBLIC madhava_reused)
