@@ -48,13 +48,22 @@ std::string SpectralTokenizer::decode(const std::vector<Quat>& states) const {
             "SpectralTokenizer::decode: state count not a multiple of embed_dim");
     }
 
-    // Reference states for each ASCII char (position-independent; the probe
-    // applies the position phase to the state side, matching encode).
-    auto ref_state = [&](int ascii_val, size_t pos) {
+    // Precompute the position-independent reference states ONCE (pos = 0):
+    //   phase_0 = (ascii + 0 + j)·2π/256
+    // The position shift pos·2π/256 is a CONSTANT phase rotation across all
+    // modes, so it can be applied as a rotation factor instead of recomputing
+    // sin/cos for every character (the previous version recomputed 95·d·4 trig
+    // calls per character — the decode bottleneck).
+    struct RefSet {
+        std::vector<std::vector<Quat>> refs;  // indexed by (ascii - kAsciiMin)
+    };
+    RefSet base_refs;
+    base_refs.refs.reserve(kAsciiMax - kAsciiMin + 1);
+    for (int ascii_val = kAsciiMin; ascii_val <= kAsciiMax; ++ascii_val) {
         std::vector<Quat> ref;
         ref.reserve(embed_dim_);
         for (int j = 0; j < embed_dim_; ++j) {
-            float phase = (ascii_val + static_cast<int>(pos) + j) * 2.0f * kPi / 256.0f;
+            float phase = (ascii_val + j) * 2.0f * kPi / 256.0f;
             float amp = (ascii_val / 127.0f) * (static_cast<float>(j) / embed_dim_);
             ref.push_back({
                 amp * std::cos(phase),
@@ -63,8 +72,8 @@ std::string SpectralTokenizer::decode(const std::vector<Quat>& states) const {
                 amp * std::sin(phase + kPi / 4.0f),
             });
         }
-        return ref;
-    };
+        base_refs.refs.push_back(std::move(ref));
+    }
 
     std::string out;
     out.reserve(n_chars);
@@ -74,17 +83,38 @@ std::string SpectralTokenizer::decode(const std::vector<Quat>& states) const {
         // This is the exact scan (the decode ceiling). Complexity O(95 · d · 4).
         std::vector<float> sims;
         sims.reserve(kAsciiMax - kAsciiMin + 1);
+
+        // The state's norm is constant across the 95 candidates — compute it
+        // ONCE per character.
+        const Quat* st_base = &states[c * static_cast<size_t>(embed_dim_)];
+        float n1 = 0.0f;
+        for (int j = 0; j < embed_dim_; ++j) {
+            const Quat& st = st_base[j];
+            n1 += st.w*st.w + st.x*st.x + st.y*st.y + st.z*st.z;
+        }
+        const float sqrt_n1 = std::sqrt(n1);
+
+        // Position phase shift: pos·2π/256 (a constant rotation factor).
+        const float pos_phase = static_cast<float>(c) * 2.0f * kPi / 256.0f;
+        const float cp = std::cos(pos_phase), sp = std::sin(pos_phase);
+
         for (int ascii_val = kAsciiMin; ascii_val <= kAsciiMax; ++ascii_val) {
-            auto ref = ref_state(ascii_val, c);
-            float ip = 0.0f, n1 = 0.0f, n2 = 0.0f;
+            const auto& ref = base_refs.refs[ascii_val - kAsciiMin];
+            float ip = 0.0f, n2 = 0.0f;
             for (int j = 0; j < embed_dim_; ++j) {
-                const Quat& st = states[c * static_cast<size_t>(embed_dim_) + j];
+                const Quat& st = st_base[j];
                 const Quat& m  = ref[j];
-                ip += st.w*m.w + st.x*m.x + st.y*m.y + st.z*m.z;
-                n1 += st.w*st.w + st.x*st.x + st.y*st.y + st.z*st.z;
-                n2 += m.w*m.w + m.x*m.x + m.y*m.y + m.z*m.z;
+                // Rotate the reference phase by the position shift: the (w,x)
+                // AND (y,z) complex pairs both rotate by pos_phase (the π/4 in
+                // y/z is a fixed offset preserved by the rotation).
+                float mw = m.w * cp - m.x * sp;
+                float mx = m.w * sp + m.x * cp;
+                float my = m.y * cp - m.z * sp;
+                float mz = m.y * sp + m.z * cp;
+                ip += st.w*mw + st.x*mx + st.y*my + st.z*mz;
+                n2 += mw*mw + mx*mx + my*my + mz*mz;
             }
-            float denom = std::sqrt(n1 * n2) + kEps;
+            float denom = sqrt_n1 * std::sqrt(n2) + kEps;
             sims.push_back(ip / denom);
         }
 
