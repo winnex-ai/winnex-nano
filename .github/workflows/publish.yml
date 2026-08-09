@@ -1,8 +1,6 @@
 name: publish
 
 # Publish winnex-nano to PyPI using a Trusted Publisher (OpenID Connect).
-# This is the credential-free mechanism recommended by PyPI — no API token
-# needed. The PyPI-side configuration must match EXACTLY:
 #
 #   PyPI Project Name : winnex-nano
 #   Owner             : winnex-ai
@@ -10,14 +8,15 @@ name: publish
 #   Workflow name     : publish.yml
 #   Environment name  : publish
 #
-# The wheel is built inside the official PyPA manylinux Docker image so it
-# carries a broad manylinux platform tag (not a host-specific linux_x86_64).
+# The wheel is built inside the official PyPA manylinux Docker image (broad
+# manylinux tag), then PUBLISHED from the native runner — the OIDC Trusted
+# Publisher cannot run inside the manylinux container (unsupported env).
 
 on:
   push:
     tags:
-      - "v*"          # v0.1.0, v0.1.1, ... trigger a release
-  workflow_dispatch:  # allow manual trigger from the Actions tab
+      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,7 +25,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux_2_28_x86_64   # manylinux toolchain
+    container: quay.io/pypa/manylinux_2_28_x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -41,6 +40,27 @@ jobs:
           PY=/opt/python/cp312-cp312/bin/python
           $PY -m pip install --quiet auditwheel
           auditwheel repair dist/*.whl -w dist/repair --plat manylinux_2_28_x86_64
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 1
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    environment: publish
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
       - name: Publish to PyPI (Trusted Publisher / OIDC)
         uses: pypa/gh-action-pypi-publish@release/v1
