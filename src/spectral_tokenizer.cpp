@@ -1,4 +1,4 @@
-// spectral_tokenizer.cpp — PsiQRH spectral tokenizer (deterministic).
+// spectral_tokenizer.cpp — Winnex spectral tokenizer (deterministic).
 #include "winnex_nano/spectral_tokenizer.hpp"
 
 #include <algorithm>
@@ -48,39 +48,34 @@ std::string SpectralTokenizer::decode(const std::vector<Quat>& states) const {
             "SpectralTokenizer::decode: state count not a multiple of embed_dim");
     }
 
+    // Reference states for each ASCII char (position-independent; the probe
+    // applies the position phase to the state side, matching encode).
+    auto ref_state = [&](int ascii_val, size_t pos) {
+        std::vector<Quat> ref;
+        ref.reserve(embed_dim_);
+        for (int j = 0; j < embed_dim_; ++j) {
+            float phase = (ascii_val + static_cast<int>(pos) + j) * 2.0f * kPi / 256.0f;
+            float amp = (ascii_val / 127.0f) * (static_cast<float>(j) / embed_dim_);
+            ref.push_back({
+                amp * std::cos(phase),
+                amp * std::sin(phase),
+                amp * std::cos(phase + kPi / 4.0f),
+                amp * std::sin(phase + kPi / 4.0f),
+            });
+        }
+        return ref;
+    };
+
     std::string out;
     out.reserve(n_chars);
 
     for (size_t c = 0; c < n_chars; ++c) {
-        // Inner products of this char's spectral state against every char's
-        // reference pattern.
-        std::vector<float> probs;
-        probs.reserve(kAsciiMax - kAsciiMin + 1);
-
-        // Reference states for each ASCII char, computed with the SAME encode
-        // formula INCLUDING the sequence position c (the phase shift (ascii+c+j)
-        // is what distinguishes chars at a given position). Comparing full
-        // quaternion states preserves the phase pattern.
-        auto ref_state = [&](int ascii_val) {
-            std::vector<Quat> ref;
-            ref.reserve(embed_dim_);
-            for (int j = 0; j < embed_dim_; ++j) {
-                float phase = (ascii_val + static_cast<int>(c) + j) * 2.0f * kPi / 256.0f;
-                float amp = (ascii_val / 127.0f) * (static_cast<float>(j) / embed_dim_);
-                ref.push_back({
-                    amp * std::cos(phase),
-                    amp * std::sin(phase),
-                    amp * std::cos(phase + kPi / 4.0f),
-                    amp * std::sin(phase + kPi / 4.0f),
-                });
-            }
-            return ref;
-        };
-
+        // Quaternion cosine similarity against every printable ASCII char.
+        // This is the exact scan (the decode ceiling). Complexity O(95 · d · 4).
+        std::vector<float> sims;
+        sims.reserve(kAsciiMax - kAsciiMin + 1);
         for (int ascii_val = kAsciiMin; ascii_val <= kAsciiMax; ++ascii_val) {
-            auto ref = ref_state(ascii_val);
-            // Quaternion cosine similarity over the full [embed_dim, 4] state,
-            // with the position-dependent phase already baked into the state.
+            auto ref = ref_state(ascii_val, c);
             float ip = 0.0f, n1 = 0.0f, n2 = 0.0f;
             for (int j = 0; j < embed_dim_; ++j) {
                 const Quat& st = states[c * static_cast<size_t>(embed_dim_) + j];
@@ -90,30 +85,22 @@ std::string SpectralTokenizer::decode(const std::vector<Quat>& states) const {
                 n2 += m.w*m.w + m.x*m.x + m.y*m.y + m.z*m.z;
             }
             float denom = std::sqrt(n1 * n2) + kEps;
-            probs.push_back(ip / denom);
+            sims.push_back(ip / denom);
         }
 
-        // Moderate amplification + safe normalization (not softmax).
-        float max_p = *std::max_element(probs.begin(), probs.end());
-        if (max_p > 1.0f) {
-            for (auto& v : probs) v /= max_p;
+        // Madhava principle: select the TOP-K by bound, re-score exactly only
+        // the survivors. NO exp/sum (no softmax of any form). The decode is a
+        // deterministic top-1 selection by cosine similarity.
+        const int k = 1;  // hard decode: top-1 (the reference char)
+        std::vector<int> idx(95);
+        for (int i = 0; i < 95; ++i) idx[i] = i;
+        // Partial selection of the top-k (exact scan is only 95 — negligible).
+        for (int i = 0; i < k; ++i) {
+            for (int j = i + 1; j < 95; ++j) {
+                if (sims[j] > sims[idx[i]]) idx[i] = j;
+            }
         }
-        float sum = 0.0f;
-        for (auto& v : probs) {
-            v = std::exp(v * kProbeGain);
-            sum += v;
-        }
-        if (sum > kEps) {
-            for (auto& v : probs) v /= sum;
-        }
-
-        // argmax.
-        size_t best = 0;
-        float best_v = probs[0];
-        for (size_t i = 1; i < probs.size(); ++i) {
-            if (probs[i] > best_v) { best_v = probs[i]; best = i; }
-        }
-        out.push_back(static_cast<char>(kAsciiMin + static_cast<int>(best)));
+        out.push_back(static_cast<char>(kAsciiMin + idx[0]));
     }
     return out;
 }

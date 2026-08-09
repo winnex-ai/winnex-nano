@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark honesto — winnex-nano (tokenizer espectral PsiQRH) vs BPE.
+Benchmark honesto — winnex-nano (tokenizer espectral Winnex) vs BPE.
 
 Compara em métricas REAIS:
   1. Corretude de round-trip (texto -> espectro -> texto)
@@ -32,7 +32,7 @@ SAMPLES = [
     "Madhava: busca vetorial deterministica com prova Cauchy-Schwarz",
     "O despacho aduaneiro exige documentacao completa para importacao",
     "Folha de pagamento processada mensalmente pelo departamento de RH",
-    "PsiQRH reformula transformers usando matematica quaternionica",
+    "Winnex reformula transformers usando matematica quaternionica",
     "Os 123 numeros e 456 simbolos !@# devem ser preservados fielmente",
     "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z",
     "Teste de acentuacao: acao, coracao, licao, composicao",
@@ -146,7 +146,7 @@ def bench_bpe():
 # ============================================================================
 def main():
     print("=" * 72)
-    print("BENCHMARK HONESTO — winnex-nano (tokenizer espectral PsiQRH)")
+    print("BENCHMARK HONESTO — winnex-nano (tokenizer espectral Winnex)")
     print("=" * 72)
 
     # Espectral

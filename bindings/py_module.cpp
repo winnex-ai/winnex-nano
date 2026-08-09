@@ -14,7 +14,7 @@ namespace py = pybind11;
 using namespace winnex_nano;
 
 PYBIND11_MODULE(_winnex_nano, m) {
-    m.doc() = "winnex-nano: native PsiQRH spectral tokenizer + weight balancer";
+    m.doc() = "winnex-nano: native Winnex spectral tokenizer + weight balancer";
 
     py::class_<Quat>(m, "Quat")
         .def(py::init<>())

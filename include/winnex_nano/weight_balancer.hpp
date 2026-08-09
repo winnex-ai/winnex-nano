@@ -1,5 +1,5 @@
 /**
- * weight_balancer.hpp — PsiQRH-derived multimodel weight blending.
+ * weight_balancer.hpp — Winnex-derived multimodel weight blending.
  *
  *   W' = Σᵢ αᵢ · R(qᵢ) · Wᵢ      with Σᵢ αᵢ = 1, 0 ≤ αᵢ ≤ 1
  *

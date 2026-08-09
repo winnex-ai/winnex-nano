@@ -1,7 +1,7 @@
 /**
  * winnex_nano.hpp — native Winnex LLM inference engine (C++20, OpenCL, no CUDA).
  *
- * Reuses the winnex-madhava kernels (QK^T matmul, softmax-free attention via
+ * Reuses the winnex-madhava kernels (QK^T matmul, selective-top-K attention via
  * top-k + Cauchy-Schwarz bounds, quantization, AVX2/OpenMP/OpenCL) through
  * direct source compilation — NO code duplication. This package adds the
  * LLM-only layers: BPE tokenizer, safetensors loader, tensor ops (RMSNorm,
@@ -110,7 +110,7 @@ void gptq_matmul(float* y, const float* x, const uint8_t* qweight,
                  int in_dim, int out_dim, int group_size);
 
 // ---------------------------------------------------------------------------
-// Weight balancer — the PsiQRH-derived multimodel blending:
+// Weight balancer — the Winnex-derived multimodel blending:
 //     W' = Σᵢ αᵢ · R(qᵢ) · Wᵢ      with Σᵢ αᵢ = 1
 // α = operator-controlled blend weights; R(q) is an optional quaternion
 // rotation applied per tensor (a "control knob" for phase, avoiding the

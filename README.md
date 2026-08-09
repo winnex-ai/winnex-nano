@@ -4,7 +4,7 @@
 
 Model-agnostic (Qwen / BERT / DeepSeek / GPT), C++20/OpenCL, no CUDA. Reuses the
 [winnex-madhava](https://pypi.org/project/winnex-madhava/) engine kernels (QKᵀ matmul,
-softmax-free top-K with Cauchy-Schwarz bounds) — no code duplication.
+selective-top-K with Cauchy-Schwarz bounds) — no code duplication.
 
 ## Components
 

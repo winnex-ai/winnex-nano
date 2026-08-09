@@ -1,4 +1,4 @@
-// test_spectral_tokenizer.cpp — round-trip validation of the PsiQRH spectral
+// test_spectral_tokenizer.cpp — round-trip validation of the Winnex spectral
 // tokenizer (encode(text) -> decode(encode(text)) == text) and the
 // multimodel weight balancer (W' = Σαᵢ·R(qᵢ)·Wᵢ).
 #include "winnex_nano/spectral_tokenizer.hpp"
@@ -21,7 +21,7 @@ int main() {
     const std::vector<std::string> samples = {
         "Winnex AI",
         "Madhava engine",
-        "PsiQRH spectral tokenizer",
+        "Winnex spectral tokenizer",
         "A B C 123 !@#",
         "Deterministic round-trip test 456",
     };

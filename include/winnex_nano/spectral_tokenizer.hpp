@@ -1,5 +1,5 @@
 /**
- * spectral_tokenizer.hpp — PsiQRH-derived spectral tokenizer (deterministic).
+ * spectral_tokenizer.hpp — Winnex-derived spectral tokenizer (deterministic).
  *
  * Replaces BPE with a character → quaternion spectral representation that is
  * PURE arithmetic (no vocabulary, no training, no external tokenizer files):
@@ -50,7 +50,7 @@ inline Quat quat_mul(const Quat& a, const Quat& b) {
     };
 }
 
-// Unit quaternion from rotation parameters (θ, ω, φ) — the PsiQRH "control knob".
+// Unit quaternion from rotation parameters (θ, ω, φ) — the Winnex "control knob".
 inline Quat unit_quaternion(float theta, float omega, float phi) {
     float th = theta * 0.5f;
     float st = std::sin(th), ct = std::cos(th);

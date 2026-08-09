@@ -8,7 +8,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ============================================================================
 # Reuse the winnex-madhava engine WITHOUT duplicating code.
 # winnex-nano compiles the Madhava sources directly (shared kernels: QK^T
-# matmul, top-k, softmax-free attention, quantization, AVX2/OpenMP/OpenCL).
+# matmul, top-k, selective-top-K attention, quantization, AVX2/OpenMP/OpenCL).
 # The Madhava sources are referenced (not copied) — same files, one build.
 # ============================================================================
 find_package(OpenMP REQUIRED)
@@ -48,7 +48,7 @@ endif()
 target_link_libraries(madhava_reused PUBLIC OpenMP::OpenMP_CXX)
 
 # ============================================================================
-# winnex-nano core (PsiQRH spectral layer + weight balancer + tensor engine)
+# winnex-nano core (Winnex spectral layer + weight balancer + tensor engine)
 # ============================================================================
 add_library(winnex_nano
     src/spectral_tokenizer.cpp

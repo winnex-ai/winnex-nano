@@ -48,12 +48,10 @@ for each candidate ASCII value a' ∈ [32, 126]:
     ref[j] = same formula as encoding, at position p
     similarity(a') = ⟨ψ, ref⟩ / (‖ψ‖·‖ref‖)     (quaternion cosine similarity)
     P = [similarity(a') for all a']
-    P = exp(P · gain)          (moderate amplification, gain = 10)
-    P = P / ΣP                 (safe normalization — NOT softmax)
-    decoded_char = argmax(P)
+    decoded_char = argmax(cosine_similarity(ψ, ref))  (deterministic top-1)
 ```
 
-**Key distinction from softmax:** the probe is an **inner-product + exponential + normalization** — it does not require a full probability distribution over a vocabulary, only over the printable ASCII set. It combines with the Madhava top-K selective principle (the softmax-free attention).
+**Madhava principle:** the probe is a **deterministic top-1 by cosine similarity** over the printable ASCII set — a hard selection, not a probability distribution. This follows the Madhava selective-top-K principle (no exp/sum over the candidate set).
 
 ### 2.3 Round-trip guarantee
 
@@ -125,7 +123,7 @@ Measured on a single host (RTX 5060 Ti, x86-64, GCC -O2). No cherry-picking.
 ## 6. Implementation
 
 - **Language:** C++20, OpenMP/AVX2, OpenCL (dlopen loader, no CUDA).
-- **Kernel reuse:** winnex-madhava sources are compiled directly (QKᵀ matmul, top-K, softmax-free attention) — no code duplication.
+- **Kernel reuse:** winnex-madhava sources are compiled directly (QKᵀ matmul, top-K, selective-top-K attention) — no code duplication.
 - **Files:**
   - `include/winnex_nano/spectral_tokenizer.hpp` — the disclosed mathematics
   - `include/winnex_nano/weight_balancer.hpp` — the fusion operator
@@ -137,7 +135,7 @@ Measured on a single host (RTX 5060 Ti, x86-64, GCC -O2). No cherry-picking.
 
 1. A deterministic character-to-quaternion spectral tokenizer requiring no vocabulary, no training, and no external tokenizer.
 2. An invertible spectral round-trip with 0% reconstruction error on the tested corpus.
-3. A softmax-free probe (inner-product + exponential + normalization) for decoding.
+3. A deterministic top-1 probe (cosine similarity, Madhava selective-top-K) for decoding — no softmax.
 4. A multimodel weight-balancing operator `W' = Σᵢ αᵢ·R(qᵢ)·Wᵢ` with operator-controlled coefficients and optional quaternion phase alignment.
 5. Model-agnostic engine architecture reusing the Winnex-Madhava kernel suite without code duplication.
 

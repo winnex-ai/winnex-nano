@@ -15,7 +15,7 @@ authors = [
 keywords = [
     "inference", "llm", "spectral", "tokenizer", "quaternion", "multimodel",
     "weight-balancing", "streaming", "sse", "madhava", "deterministic",
-    "opencl", "winnex", "softmax-free",
+    "opencl", "winnex", "deterministic",
 ]
 classifiers = [
     "Programming Language :: C++",
