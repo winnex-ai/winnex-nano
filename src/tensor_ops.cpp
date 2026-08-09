@@ -46,31 +46,40 @@ void silu_inplace(float* x, int n) {
 void gptq_matmul(float* y, const float* x, const std::uint8_t* qweight,
                  const std::uint8_t* qzeros, const float* scales,
                  const std::int32_t* g_idx, int in_dim, int out_dim, int group_size) {
-    // GPTQ int4 packed: qweight[row][out], each int32 holds 8 int4 values.
-    // row = in/8, so qweight shape is [in_dim/8, out_dim].
-    const int packed = in_dim / 8;
+    // GPTQ int4 packed, desc_act=false layout (the Qwen/Winnex models):
+    //   qweight[out/8][in]      row = output/8, each int32 holds 8 int4
+    //                           weights along the INPUT dim
+    //   qzeros[out/gs][in/8]    zero-points packed per (group, input-block)
+    //   scales[out/gs][in]      scale per (group, input)
+    //   g_idx[in]               per-input group (desc_act=true only; ignored)
+    // For output o, the weight row is o/8 and the nibble within each int32 is
+    // o%8. Each int32 at [row][i] holds the 8 outputs {o/8*8 .. o/8*8+7} for
+    // input i. So for output o and input i:
+    //   w[o][i] = nibble(o%8) of qweight[o/8][i]
+    //   z[grp][i] = nibble(o%8) of qzeros[grp][i/8]
+    //   scale[grp][i]
+    //   acc[o] += x[i] * (w - z) * scale
+    const int packed_in = in_dim / 8;
     const int groups = out_dim / group_size;
+    const int shift = 0;  // nibble offset varies by output
 
     for (int o = 0; o < out_dim; ++o) {
+        const int row = o >> 3;
+        const int nib = o & 7;
+        const int sh = nib * 4;
+        int grp = o / group_size;  // desc_act=false: group by output position
+        const std::int32_t* wrow = reinterpret_cast<const std::int32_t*>(qweight)
+                                   + (size_t)row * in_dim;
+        const std::int32_t* zbase = reinterpret_cast<const std::int32_t*>(qzeros)
+                                    + (size_t)grp * packed_in;
+        const float* srow = scales + (size_t)grp * in_dim;
+
         float acc = 0.0f;
-        // Determine the scale group for this output column.
-        int grp = (g_idx && g_idx[o] >= 0) ? g_idx[o] : o / group_size;
-        float scale = scales[(size_t)grp * out_dim + o];
-
-        for (int r = 0; r < packed; ++r) {
-            // qzeros per group: qzeros[grp][packed] int32-packed.
-            std::int32_t zraw = reinterpret_cast<const std::int32_t*>(
-                qzeros)[(size_t)grp * packed + r];
-            std::int32_t wraw = reinterpret_cast<const std::int32_t*>(
-                qweight)[(size_t)r * out_dim + o];
-
-            for (int k = 0; k < 8; ++k) {
-                int shift = k * 4;
-                int wi = (wraw >> shift) & 0xF;
-                int zi = (zraw >> shift) & 0xF;
-                int v = wi - zi;
-                acc += x[r * 8 + k] * (v * scale);
-            }
+        for (int i = 0; i < in_dim; ++i) {
+            int wi = (wrow[i] >> sh) & 0xF;
+            int zi = (zbase[i >> 3] >> sh) & 0xF;
+            int v = wi - zi;
+            acc += x[i] * (v * srow[i]);
         }
         y[o] = acc;
     }
