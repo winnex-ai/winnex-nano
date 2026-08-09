@@ -16,6 +16,21 @@ find_package(OpenMP REQUIRED)
 if(NOT DEFINED MADHAVA_ROOT)
     set(MADHAVA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../winnex-madhava")
 endif()
+
+# If the winnex-madhava sources are not present locally (e.g. building from an
+# sdist), fetch them from the GitHub repo (the dependency is winnex-madhava on
+# PyPI; its C++ sources live in winnex-ai/winnex-madhava).
+if(NOT EXISTS "${MADHAVA_ROOT}/CMakeLists.txt")
+    message(STATUS "winnex-nano: winnex-madhava sources not found locally — fetching from GitHub")
+    include(FetchContent)
+    FetchContent_Declare(
+        winnex_madhava_src
+        GIT_REPOSITORY https://github.com/winnex-ai/winnex-madhava.git
+        GIT_TAG v1.8.1
+    )
+    FetchContent_Populate(winnex_madhava_src)
+    set(MADHAVA_ROOT "${winnex_madhava_src_SOURCE_DIR}")
+endif()
 message(STATUS "winnex-nano: reusing winnex-madhava at ${MADHAVA_ROOT}")
 
 set(MADHAVA_SRC
