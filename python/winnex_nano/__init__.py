@@ -45,6 +45,14 @@ from ._winnex_nano import (
     load_config,
 )
 
+# X-Factor model conversion (weights → manifold) — the primary purpose.
+from . import model_converter
+from .model_converter import (
+    compute_model_projector,
+    convert_weights_stream,
+    convert_tensor,
+)
+
 __version__ = "0.1.7"
 
 __all__ = [
@@ -65,5 +73,9 @@ __all__ = [
     "dense_matmul",
     "rms_norm",
     "load_config",
+    "compute_model_projector",
+    "convert_weights_stream",
+    "convert_tensor",
+    "model_converter",
     "__version__",
 ]

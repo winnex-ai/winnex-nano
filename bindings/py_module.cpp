@@ -119,9 +119,32 @@ PYBIND11_MODULE(_winnex_nano, m) {
             for (const auto& kv : st.tensors()) names.push_back(kv.first);
             return names;
         })
+        .def("tensor_shape", [](const Safetensors& st, const std::string& name) {
+            const auto& t = st.get(name);
+            return std::vector<int64_t>(t.shape.begin(), t.shape.end());
+        }, py::arg("name"))
         .def("to_float", [](const Safetensors& st, const std::string& name) {
-            return as_float_vec(py::array_t<float>(st.to_float(st.get(name))));
-        }, py::arg("name"));
+            return st.to_float(st.get(name));  // std::vector<float> -> list
+        }, py::arg("name"))
+        .def("read_rows", [](const Safetensors& st, const std::string& name,
+                             int row_start, int n_rows) {
+            // Reads n_rows rows [row_start, row_start+n_rows) of a 2D tensor
+            // WITHOUT materializing the full tensor in Python. Returns a
+            // (n_rows, cols) float32 numpy array. This is the memory-bounded
+            // path for converting giant tensors (embed_tokens).
+            const auto& t = st.get(name);
+            if (t.shape.size() != 2) throw std::runtime_error("read_rows: tensor must be 2D");
+            int rows = (int)t.shape[0];
+            int cols = (int)t.shape[1];
+            if (row_start < 0 || n_rows < 0 || row_start + n_rows > rows)
+                throw std::runtime_error("read_rows: out of range");
+            auto all = st.to_float(t);  // full tensor in C++ (freed after)
+            py::array_t<float> out({(py::ssize_t)n_rows, (py::ssize_t)cols});
+            std::memcpy(out.mutable_data(),
+                        all.data() + (size_t)row_start * cols,
+                        (size_t)n_rows * cols * sizeof(float));
+            return out;
+        }, py::arg("name"), py::arg("row_start"), py::arg("n_rows"));
 
     // --- ModelConfig + load_config -----------------------------------------
     py::class_<ModelConfig>(m, "ModelConfig")
