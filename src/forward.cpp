@@ -101,6 +101,28 @@ ForwardEngine::ForwardEngine(const ModelConfig& cfg, const Safetensors& st)
         throw std::runtime_error("ForwardEngine: invalid config (head_dim/heads)");
     }
     param_count_ = 0;
+
+    // Precompute the model-wide tensors once (the forward path reuses them).
+    final_norm_ = st_->to_float(st_->get("model.norm.weight"));
+    param_count_ += final_norm_.size();
+    if (st_->has("lm_head.weight")) {
+        embed_tokens_ = st_->to_float(st_->get("lm_head.weight"));  // [V, H]
+        has_separate_lm_head_ = true;
+    } else {
+        embed_tokens_ = st_->to_float(st_->get("model.embed_tokens.weight"));  // [V, H]
+    }
+    param_count_ += embed_tokens_.size();
+
+    // Parameter count: per-layer weights × layers (counted once, not per token).
+    if (cfg_.num_hidden_layers > 0) {
+        const int H = cfg_.hidden_size, kv = cfg_.head_dim * cfg_.num_key_value_heads;
+        const int inter = cfg_.intermediate_size;
+        size_t per_layer =
+            2 * H +                              // in_norm + post_norm
+            H * H * 3 + kv * H + H * H +         // q (H×H) + k (kv×H) + v (kv×H) + o (H×H)
+            inter * H * 2 + H * inter;           // gate + up + down
+        param_count_ += per_layer * (size_t)cfg_.num_hidden_layers;
+    }
 }
 
 namespace {
@@ -109,13 +131,10 @@ namespace {
 // (".qweight"/".qzeros"/".scales") if the dense weight is absent.
 std::vector<float> load_dense_or_gptq_scales(const Safetensors& st,
                                              const std::string& base,
-                                             size_t& param_count,
                                              bool& is_gptq) {
     if (st.has(base + ".weight")) {
         is_gptq = false;
-        auto w = st.to_float(st.get(base + ".weight"));
-        param_count += w.size();
-        return w;
+        return st.to_float(st.get(base + ".weight"));
     }
     // GPTQ fallback: dequantize lazily per forward is not supported in the
     // dense path — the dense engine is the target. If only GPTQ tensors are
@@ -139,13 +158,13 @@ void ForwardEngine::load_layer(int layer, LayerWeights& w) {
     // Dense f32 path (the native non-GPTQ engine). If a projection only has
     // GPTQ tensors, is_gptq is set and we throw a clear error.
     bool is_gptq = false;
-    w.q_w = load_dense_or_gptq_scales(*st_, L + "self_attn.q_proj", param_count_, is_gptq);
-    w.k_w = load_dense_or_gptq_scales(*st_, L + "self_attn.k_proj", param_count_, is_gptq);
-    w.v_w = load_dense_or_gptq_scales(*st_, L + "self_attn.v_proj", param_count_, is_gptq);
-    w.o_w = load_dense_or_gptq_scales(*st_, L + "self_attn.o_proj", param_count_, is_gptq);
-    w.g_w = load_dense_or_gptq_scales(*st_, L + "mlp.gate_proj", param_count_, is_gptq);
-    w.u_w = load_dense_or_gptq_scales(*st_, L + "mlp.up_proj",   param_count_, is_gptq);
-    w.d_w = load_dense_or_gptq_scales(*st_, L + "mlp.down_proj", param_count_, is_gptq);
+    w.q_w = load_dense_or_gptq_scales(*st_, L + "self_attn.q_proj", is_gptq);
+    w.k_w = load_dense_or_gptq_scales(*st_, L + "self_attn.k_proj", is_gptq);
+    w.v_w = load_dense_or_gptq_scales(*st_, L + "self_attn.v_proj", is_gptq);
+    w.o_w = load_dense_or_gptq_scales(*st_, L + "self_attn.o_proj", is_gptq);
+    w.g_w = load_dense_or_gptq_scales(*st_, L + "mlp.gate_proj", is_gptq);
+    w.u_w = load_dense_or_gptq_scales(*st_, L + "mlp.up_proj",   is_gptq);
+    w.d_w = load_dense_or_gptq_scales(*st_, L + "mlp.down_proj", is_gptq);
     if (is_gptq) {
         throw std::runtime_error(
             "ForwardEngine: model uses GPTQ int4 weights but the native dense "
@@ -300,34 +319,82 @@ std::vector<float> ForwardEngine::forward(const std::vector<float>& hidden,
 
     // Final RMSNorm.
     std::vector<float> hnorm(seq_len * H);
-    // Need the final norm weights.
-    const auto& fn = st_->get("model.norm.weight");
-    auto fn_w = st_->to_float(fn);
-    rms_norm(hnorm.data(), h.data(), fn_w.data(), seq_len, H, cfg_.rms_norm_eps);
-
-    // lm_head: tied to embed_tokens (Qwen ties them). If a separate
-    // lm_head.weight exists (non-tied), prefer it.
-    const int V = cfg_.vocab_size;
-    std::vector<float> emb;
-    if (st_->has("lm_head.weight")) {
-        emb = st_->to_float(st_->get("lm_head.weight"));
-    } else {
-        emb = st_->to_float(st_->get("model.embed_tokens.weight"));  // [V, H]
-    }
+    rms_norm(hnorm.data(), h.data(), final_norm_.data(), seq_len, H, cfg_.rms_norm_eps);
 
     // Logits for the last position (or all) — dense_matmul over the rows.
+    const int V = cfg_.vocab_size;
     if (!all_positions) {
         std::vector<float> logits(V);
         const float* ht = hnorm.data() + (size_t)(seq_len - 1) * H;
-        dense_matmul(logits.data(), ht, emb.data(), H, V);
+        dense_matmul(logits.data(), ht, embed_tokens_.data(), H, V);
         return logits;
     }
     std::vector<float> logits((size_t)seq_len * V);
     for (int t = 0; t < seq_len; ++t) {
         const float* ht = hnorm.data() + (size_t)t * H;
-        dense_matmul(logits.data() + (size_t)t * V, ht, emb.data(), H, V);
+        dense_matmul(logits.data() + (size_t)t * V, ht, embed_tokens_.data(), H, V);
     }
     return logits;
+}
+
+void ForwardEngine::reset_cache() {
+    const int kv_out = cfg_.head_dim * cfg_.num_key_value_heads;
+    k_caches_.assign(cfg_.num_hidden_layers, std::vector<float>());
+    v_caches_.assign(cfg_.num_hidden_layers, std::vector<float>());
+    ctx_len_ = 0;
+}
+
+std::vector<float> ForwardEngine::forward_next(const std::vector<float>& hidden) {
+    const int H = cfg_.hidden_size;
+    if ((int)hidden.size() != H) {
+        throw std::runtime_error("ForwardEngine::forward_next: hidden must be length H");
+    }
+    const int kv_out = cfg_.head_dim * cfg_.num_key_value_heads;
+
+    // Grow the persistent cache to hold the new token.
+    for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
+        k_caches_[layer].resize((size_t)(ctx_len_ + 1) * kv_out);
+        v_caches_[layer].resize((size_t)(ctx_len_ + 1) * kv_out);
+    }
+
+    // Run a single token through all layers, attending to the full cache.
+    std::vector<float> h = hidden;  // [1, H]
+    for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
+        run_layer(layer, h, /*seq_len=*/1, k_caches_[layer], v_caches_[layer], ctx_len_);
+    }
+    ++ctx_len_;
+
+    // Final RMSNorm + lm_head → logits for this token.
+    std::vector<float> hnorm(H);
+    rms_norm(hnorm.data(), h.data(), final_norm_.data(), 1, H, cfg_.rms_norm_eps);
+    std::vector<float> logits(cfg_.vocab_size);
+    dense_matmul(logits.data(), hnorm.data(), embed_tokens_.data(), H, cfg_.vocab_size);
+    return logits;
+}
+
+std::vector<int> ForwardEngine::generate(const std::vector<float>& h_prompt,
+                                         int max_new_tokens, int eos_id) {
+    if ((int)h_prompt.size() != cfg_.hidden_size) {
+        throw std::runtime_error("ForwardEngine::generate: h_prompt must be length H");
+    }
+    reset_cache();
+    std::vector<int> out;
+    out.reserve(max_new_tokens);
+
+    // Decode token-by-token. The first hidden state is the prompt embedding
+    // (from the X-factor); subsequent hidden states are embed_tokens[prev].
+    std::vector<float> h = h_prompt;
+    for (int step = 0; step < max_new_tokens; ++step) {
+        std::vector<float> logits = forward_next(h);
+        int tid = argmax(logits);
+        if (tid < 0) break;
+        out.push_back(tid);
+        if (eos_id >= 0 && tid == eos_id) break;
+        // Next hidden state = embed_tokens[tid] (tied lm_head).
+        const float* row = embed_tokens_.data() + (size_t)tid * cfg_.hidden_size;
+        h.assign(row, row + cfg_.hidden_size);
+    }
+    return out;
 }
 
 int ForwardEngine::argmax(const std::vector<float>& logits) {

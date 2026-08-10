@@ -150,6 +150,18 @@ PYBIND11_MODULE(_winnex_nano, m) {
             auto logits = fe.forward(v, seq_len, all_positions);
             return py::array_t<float>((py::ssize_t)logits.size(), logits.data());
         }, py::arg("hidden"), py::arg("seq_len"), py::arg("all_positions") = false)
+        .def("forward_next", [](ForwardEngine& fe, py::array_t<float> hidden) {
+            auto v = as_float_vec(hidden);
+            auto logits = fe.forward_next(v);
+            return py::array_t<float>((py::ssize_t)logits.size(), logits.data());
+        }, py::arg("hidden"))
+        .def("generate", [](ForwardEngine& fe, py::array_t<float> h_prompt,
+                            int max_new_tokens, int eos_id) {
+            auto v = as_float_vec(h_prompt);
+            auto ids = fe.generate(v, max_new_tokens, eos_id);
+            return ids;  // std::vector<int> → list
+        }, py::arg("h_prompt"), py::arg("max_new_tokens"), py::arg("eos_id") = -1)
+        .def("reset_cache", &ForwardEngine::reset_cache)
         .def_static("argmax", &ForwardEngine::argmax, py::arg("logits"))
         .def_property_readonly("param_count", &ForwardEngine::param_count);
 

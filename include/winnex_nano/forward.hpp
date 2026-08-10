@@ -58,16 +58,43 @@ ModelConfig load_config(const std::string& config_path);
  * Owns the dequantized weight tensors it needs (lazily loaded from the
  * Safetensors). The input is a sequence of hidden states (from the X-factor
  * embedding); the output is logits over the vocab for the last position.
+ *
+ * For autoregressive generation the engine keeps a persistent KV cache
+ * between calls (reset with reset_cache / cleared implicitly when generating
+ * from a fresh prompt). The generation loop:
+ *   1. prompt text → X-factor → hidden (the first "token")
+ *   2. forward(hidden, 1) → logits → token_id (argmax)
+ *   3. next hidden = embed_tokens[token_id]  (tied lm_head path)
+ *   4. forward_next(hidden) → logits → next token_id  (uses the cache)
+ *   5. repeat until EOS / max_new_tokens.
  */
 class ForwardEngine {
 public:
     ForwardEngine(const ModelConfig& cfg, const Safetensors& st);
 
-    // Runs the forward pass on a batch of hidden states [seq, hidden_size].
-    // Returns logits [vocab_size] for the LAST position (for autoregressive
-    // generation). If `all_positions` is true, returns [seq, vocab_size].
+    // Runs the forward pass on a batch of hidden states [seq, hidden_size]
+    // with a FRESH (local) KV cache. Returns logits [vocab_size] for the LAST
+    // position (or [seq, vocab_size] if all_positions). This does not touch
+    // the persistent cache — use it for single-shot prefill.
     std::vector<float> forward(const std::vector<float>& hidden, int seq_len,
                                bool all_positions = false);
+
+    // Runs a SINGLE hidden state through all layers, attending to the
+    // PERSISTENT KV cache (appends this token's K/V to the cache). Returns
+    // logits [vocab_size] for this token. Use for autoregressive decode.
+    std::vector<float> forward_next(const std::vector<float>& hidden);
+
+    // Resets the persistent KV cache (start a new generation).
+    void reset_cache();
+
+    // Autoregressive generation: prefill with the given prompt hidden state,
+    // then decode token-by-token using the persistent cache.
+    //   h_prompt:  [hidden_size] the X-factor embedding of the prompt.
+    //   max_new_tokens: max tokens to generate.
+    //   eos_id:   stop token id (-1 = no EOS, runs max_new_tokens).
+    // Returns the generated token ids (does NOT include the prompt).
+    std::vector<int> generate(const std::vector<float>& h_prompt,
+                              int max_new_tokens, int eos_id = -1);
 
     // Greedy argmax of logits -> token id.
     static int argmax(const std::vector<float>& logits);
@@ -79,6 +106,15 @@ private:
     ModelConfig cfg_;
     const Safetensors* st_;
     size_t param_count_ = 0;
+
+    // Precomputed model-wide tensors (loaded once in the constructor).
+    std::vector<float> final_norm_;      // model.norm.weight [hidden]
+    std::vector<float> embed_tokens_;    // [vocab, hidden] (tied lm_head)
+    bool has_separate_lm_head_ = false;  // true when lm_head.weight exists
+
+    // Persistent KV cache: per-layer [ctx_len, kv_out].
+    std::vector<std::vector<float>> k_caches_, v_caches_;
+    int ctx_len_ = 0;
 
     // Lazy-loaded weight views (kept for the duration of a forward).
     struct LayerWeights;
