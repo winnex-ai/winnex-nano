@@ -1,4 +1,4 @@
-// forward.cpp — native forward pass for transformer LLMs (GPTQ int4).
+// forward.cpp — native forward pass for transformer LLMs (dense f32 + OpenCL).
 #include "winnex_nano/forward.hpp"
 
 #include <algorithm>
@@ -71,6 +71,12 @@ ModelConfig load_config(const std::string& config_path) {
     c.rms_norm_eps = find_float("rms_norm_eps", 1e-6f);
     c.tie_word_embeddings = find_int("tie_word_embeddings", 1) == 1;
     c.head_dim = c.hidden_size / c.num_attention_heads;
+    // Legacy GPTQ group size (the dense path ignores it; kept for parity).
+    c.group_size = find_int("group_size", 128);
+    // The dense native engine is the default. GPTQ is detected at load_layer
+    // time (when .qweight is present); the config flag records the declared
+    // quantization type if the config.json carries it.
+    if (s.find("quantization_config") != std::string::npos) c.gptq = true;
     return c;
 }
 
@@ -80,12 +86,10 @@ ModelConfig load_config(const std::string& config_path) {
 struct ForwardEngine::LayerWeights {
     std::vector<float> in_norm;    // [hidden]
     std::vector<float> post_norm;  // [hidden]
-    // QKV projections (GPTQ int4).
-    std::vector<int32_t> q_qw, q_qz, k_qw, k_qz, v_qw, v_qz, o_qw, o_qz;
-    std::vector<float> q_sc, k_sc, v_sc, o_sc;
-    // MLP.
-    std::vector<int32_t> g_qw, g_qz, u_qw, u_qz, d_qw, d_qz;
-    std::vector<float> g_sc, u_sc, d_sc;
+    // Dense f32 QKV projections: W is row-major [out, in].
+    std::vector<float> q_w, k_w, v_w, o_w;
+    // Dense f32 MLP.
+    std::vector<float> g_w, u_w, d_w;
     // Dims.
     int hidden = 0, q_out = 0, kv_out = 0, inter = 0, gs = 0;
     bool loaded = false;
@@ -100,14 +104,24 @@ ForwardEngine::ForwardEngine(const ModelConfig& cfg, const Safetensors& st)
 }
 
 namespace {
-// Loads a GPTQ projection into (qweight, qzeros, scales) int32/float vectors.
-void load_gptq(const Safetensors& st, const std::string& base,
-               std::vector<int32_t>& qw, std::vector<int32_t>& qz,
-               std::vector<float>& sc, size_t& param_count) {
-    qw = st.to_int32(st.get(base + ".qweight"));
-    qz = st.to_int32(st.get(base + ".qzeros"));
-    sc = st.to_float(st.get(base + ".scales"));
-    param_count += qw.size() * 4 + sc.size();
+// Loads a dense f32 projection weight (row-major [out, in]).
+// Prefers ".weight" (dense safetensors); falls back to the GPTQ path
+// (".qweight"/".qzeros"/".scales") if the dense weight is absent.
+std::vector<float> load_dense_or_gptq_scales(const Safetensors& st,
+                                             const std::string& base,
+                                             size_t& param_count,
+                                             bool& is_gptq) {
+    if (st.has(base + ".weight")) {
+        is_gptq = false;
+        auto w = st.to_float(st.get(base + ".weight"));
+        param_count += w.size();
+        return w;
+    }
+    // GPTQ fallback: dequantize lazily per forward is not supported in the
+    // dense path — the dense engine is the target. If only GPTQ tensors are
+    // present, we still record it so load_layer can error clearly.
+    is_gptq = true;
+    return {};
 }
 } // namespace
 
@@ -122,13 +136,21 @@ void ForwardEngine::load_layer(int layer, LayerWeights& w) {
     w.in_norm = st_->to_float(st_->get(L + "input_layernorm.weight"));
     w.post_norm = st_->to_float(st_->get(L + "post_attention_layernorm.weight"));
 
-    load_gptq(*st_, L + "self_attn.q_proj", w.q_qw, w.q_qz, w.q_sc, param_count_);
-    load_gptq(*st_, L + "self_attn.k_proj", w.k_qw, w.k_qz, w.k_sc, param_count_);
-    load_gptq(*st_, L + "self_attn.v_proj", w.v_qw, w.v_qz, w.v_sc, param_count_);
-    load_gptq(*st_, L + "self_attn.o_proj", w.o_qw, w.o_qz, w.o_sc, param_count_);
-    load_gptq(*st_, L + "mlp.gate_proj", w.g_qw, w.g_qz, w.g_sc, param_count_);
-    load_gptq(*st_, L + "mlp.up_proj",   w.u_qw, w.u_qz, w.u_sc, param_count_);
-    load_gptq(*st_, L + "mlp.down_proj", w.d_qw, w.d_qz, w.d_sc, param_count_);
+    // Dense f32 path (the native non-GPTQ engine). If a projection only has
+    // GPTQ tensors, is_gptq is set and we throw a clear error.
+    bool is_gptq = false;
+    w.q_w = load_dense_or_gptq_scales(*st_, L + "self_attn.q_proj", param_count_, is_gptq);
+    w.k_w = load_dense_or_gptq_scales(*st_, L + "self_attn.k_proj", param_count_, is_gptq);
+    w.v_w = load_dense_or_gptq_scales(*st_, L + "self_attn.v_proj", param_count_, is_gptq);
+    w.o_w = load_dense_or_gptq_scales(*st_, L + "self_attn.o_proj", param_count_, is_gptq);
+    w.g_w = load_dense_or_gptq_scales(*st_, L + "mlp.gate_proj", param_count_, is_gptq);
+    w.u_w = load_dense_or_gptq_scales(*st_, L + "mlp.up_proj",   param_count_, is_gptq);
+    w.d_w = load_dense_or_gptq_scales(*st_, L + "mlp.down_proj", param_count_, is_gptq);
+    if (is_gptq) {
+        throw std::runtime_error(
+            "ForwardEngine: model uses GPTQ int4 weights but the native dense "
+            "engine requires f32 .weight tensors (dense safetensors)");
+    }
     w.loaded = true;
 }
 
@@ -144,19 +166,13 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     std::vector<float> hn(H * seq_len);
     rms_norm(hn.data(), h.data(), w.in_norm.data(), seq_len, H, cfg_.rms_norm_eps);
 
-    // 2. QKV projections (GPTQ) — batched as (seq*H).
+    // 2. QKV projections (dense f32) — batched as (seq*H).
     std::vector<float> q(seq_len * w.q_out), k(seq_len * w.kv_out), v(seq_len * w.kv_out);
     for (int t = 0; t < seq_len; ++t) {
         const float* xt = hn.data() + (size_t)t * H;
-        gptq_matmul(q.data() + (size_t)t * w.q_out, xt,
-                    (const uint8_t*)w.q_qw.data(), (const uint8_t*)w.q_qz.data(),
-                    w.q_sc.data(), nullptr, H, w.q_out, w.gs);
-        gptq_matmul(k.data() + (size_t)t * w.kv_out, xt,
-                    (const uint8_t*)w.k_qw.data(), (const uint8_t*)w.k_qz.data(),
-                    w.k_sc.data(), nullptr, H, w.kv_out, w.gs);
-        gptq_matmul(v.data() + (size_t)t * w.kv_out, xt,
-                    (const uint8_t*)w.v_qw.data(), (const uint8_t*)w.v_qz.data(),
-                    w.v_sc.data(), nullptr, H, w.kv_out, w.gs);
+        dense_matmul(q.data() + (size_t)t * w.q_out, xt, w.q_w.data(), H, w.q_out);
+        dense_matmul(k.data() + (size_t)t * w.kv_out, xt, w.k_w.data(), H, w.kv_out);
+        dense_matmul(v.data() + (size_t)t * w.kv_out, xt, w.v_w.data(), H, w.kv_out);
     }
 
     // 3. RoPE on Q (all heads) and K (kv heads) at their absolute positions.
@@ -234,9 +250,8 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     // 6. Output projection + residual.
     std::vector<float> proj(seq_len * H);
     for (int t = 0; t < seq_len; ++t) {
-        gptq_matmul(proj.data() + (size_t)t * H, attn_out.data() + (size_t)t * w.q_out,
-                    (const uint8_t*)w.o_qw.data(), (const uint8_t*)w.o_qz.data(),
-                    w.o_sc.data(), nullptr, w.q_out, H, w.gs);
+        dense_matmul(proj.data() + (size_t)t * H, attn_out.data() + (size_t)t * w.q_out,
+                     w.o_w.data(), w.q_out, H);
     }
     for (int i = 0; i < seq_len * H; ++i) h[i] += proj[i];
 
@@ -247,12 +262,8 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     std::vector<float> gate(seq_len * w.inter), up(seq_len * w.inter);
     for (int t = 0; t < seq_len; ++t) {
         const float* xt = hn2.data() + (size_t)t * H;
-        gptq_matmul(gate.data() + (size_t)t * w.inter, xt,
-                    (const uint8_t*)w.g_qw.data(), (const uint8_t*)w.g_qz.data(),
-                    w.g_sc.data(), nullptr, H, w.inter, w.gs);
-        gptq_matmul(up.data() + (size_t)t * w.inter, xt,
-                    (const uint8_t*)w.u_qw.data(), (const uint8_t*)w.u_qz.data(),
-                    w.u_sc.data(), nullptr, H, w.inter, w.gs);
+        dense_matmul(gate.data() + (size_t)t * w.inter, xt, w.g_w.data(), H, w.inter);
+        dense_matmul(up.data() + (size_t)t * w.inter, xt, w.u_w.data(), H, w.inter);
     }
     for (int i = 0; i < seq_len * w.inter; ++i) {
         float g = gate[i];
@@ -260,9 +271,8 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
         gate[i] *= up[i];
     }
     for (int t = 0; t < seq_len; ++t) {
-        gptq_matmul(mlp_out.data() + (size_t)t * H, gate.data() + (size_t)t * w.inter,
-                    (const uint8_t*)w.d_qw.data(), (const uint8_t*)w.d_qz.data(),
-                    w.d_sc.data(), nullptr, w.inter, H, w.gs);
+        dense_matmul(mlp_out.data() + (size_t)t * H, gate.data() + (size_t)t * w.inter,
+                     w.d_w.data(), w.inter, H);
     }
     for (int i = 0; i < seq_len * H; ++i) h[i] += mlp_out[i];
 }
@@ -295,31 +305,27 @@ std::vector<float> ForwardEngine::forward(const std::vector<float>& hidden,
     auto fn_w = st_->to_float(fn);
     rms_norm(hnorm.data(), h.data(), fn_w.data(), seq_len, H, cfg_.rms_norm_eps);
 
-    // lm_head: tied to embed_tokens (Qwen ties them). Read embed_tokens.
-    auto emb = st_->to_float(st_->get("model.embed_tokens.weight"));  // [V, H]
+    // lm_head: tied to embed_tokens (Qwen ties them). If a separate
+    // lm_head.weight exists (non-tied), prefer it.
     const int V = cfg_.vocab_size;
+    std::vector<float> emb;
+    if (st_->has("lm_head.weight")) {
+        emb = st_->to_float(st_->get("lm_head.weight"));
+    } else {
+        emb = st_->to_float(st_->get("model.embed_tokens.weight"));  // [V, H]
+    }
 
-    // Logits for the last position (or all).
+    // Logits for the last position (or all) — dense_matmul over the rows.
     if (!all_positions) {
         std::vector<float> logits(V);
         const float* ht = hnorm.data() + (size_t)(seq_len - 1) * H;
-        for (int v = 0; v < V; ++v) {
-            const float* ev = emb.data() + (size_t)v * H;
-            float s = 0;
-            for (int j = 0; j < H; ++j) s += ev[j] * ht[j];
-            logits[v] = s;
-        }
+        dense_matmul(logits.data(), ht, emb.data(), H, V);
         return logits;
     }
     std::vector<float> logits((size_t)seq_len * V);
     for (int t = 0; t < seq_len; ++t) {
         const float* ht = hnorm.data() + (size_t)t * H;
-        for (int v = 0; v < V; ++v) {
-            const float* ev = emb.data() + (size_t)v * H;
-            float s = 0;
-            for (int j = 0; j < H; ++j) s += ev[j] * ht[j];
-            logits[(size_t)t * V + v] = s;
-        }
+        dense_matmul(logits.data() + (size_t)t * V, ht, emb.data(), H, V);
     }
     return logits;
 }

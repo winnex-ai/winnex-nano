@@ -23,56 +23,58 @@ namespace {
 //   λ(v) = vᵀCv / vᵀv   is a rigorous bound on the eigenvalue (Rayleigh-Ritz),
 // exactly analogous to the Cauchy-Schwarz bound the Madhava engine uses to
 // prune without scanning everything.
-void power_eigh_topk(const std::vector<float>& A, int D, int r,
+// Computes ONE dominant eigenpair of C via power iteration + deflation,
+// appending it to (evals, evecs). Returns the eigenvector (column `k` of
+// evecs) and its eigenvalue. `C` is deflated in place.
+// Cost per call: O(D² · iters). Called until the variance target is reached
+// — the O(D²·r) path (NOT the O(D³) full eigendecomposition).
+void power_eigh_next(std::vector<float>& C, int D, int k,
                      std::vector<float>& evals, std::vector<float>& evecs) {
-    evecs.assign((size_t)D * r, 0.0f);
-    evals.assign(r, 0.0f);
-    std::vector<float> work(D), C = A;
+    std::vector<float> work(D);
 
-    for (int k = 0; k < r; ++k) {
-        // Initial vector: deterministic (column of identity + small noise).
-        std::vector<float> v(D, 0.0f);
-        v[k % D] = 1.0f;
-        if (k > 0) v[(k * 7 + 3) % D] = 0.01f;
-        // Normalize.
-        float n0 = 0;
-        for (auto x : v) n0 += x * x;
-        n0 = std::sqrt(n0) + 1e-12f;
-        for (auto& x : v) x /= n0;
+    // Initial vector: deterministic (column of identity + small noise).
+    std::vector<float> v(D, 0.0f);
+    v[k % D] = 1.0f;
+    if (k > 0) v[(k * 7 + 3) % D] = 0.01f;
+    // Normalize.
+    float n0 = 0;
+    for (auto x : v) n0 += x * x;
+    n0 = std::sqrt(n0) + 1e-12f;
+    for (auto& x : v) x /= n0;
 
-        float lambda = 0.0f;
-        for (int iter = 0; iter < 100; ++iter) {
-            // C·v
-            for (int i = 0; i < D; ++i) {
-                float s = 0.0f;
-                const float* Ci = C.data() + (size_t)i * D;
-                for (int j = 0; j < D; ++j) s += Ci[j] * v[j];
-                work[i] = s;
-            }
-            // Rayleigh quotient (the bound): λ = vᵀCv / vᵀv  (vᵀv = 1).
-            float new_lambda = 0.0f;
-            for (int i = 0; i < D; ++i) new_lambda += v[i] * work[i];
-            // Normalize work -> next v.
-            float nw = 0;
-            for (int i = 0; i < D; ++i) nw += work[i] * work[i];
-            nw = std::sqrt(nw) + 1e-12f;
-            for (int i = 0; i < D; ++i) v[i] = work[i] / nw;
-            if (std::fabs(new_lambda - lambda) < 1e-6f * (1.0f + std::fabs(new_lambda))) {
-                lambda = new_lambda;
-                break;
-            }
-            lambda = new_lambda;
-        }
-
-        // Store eigenvector (column k).
-        for (int i = 0; i < D; ++i) evecs[(size_t)i * r + k] = v[i];
-        evals[k] = lambda;
-
-        // Deflate: C ← C − λ·v·vᵀ  (removes the found direction).
+    float lambda = 0.0f;
+    for (int iter = 0; iter < 100; ++iter) {
+        // C·v
         for (int i = 0; i < D; ++i) {
-            float* Ci = C.data() + (size_t)i * D;
-            for (int j = 0; j < D; ++j) Ci[j] -= lambda * v[i] * v[j];
+            float s = 0.0f;
+            const float* Ci = C.data() + (size_t)i * D;
+            for (int j = 0; j < D; ++j) s += Ci[j] * v[j];
+            work[i] = s;
         }
+        // Rayleigh quotient (the bound): λ = vᵀCv / vᵀv  (vᵀv = 1).
+        float new_lambda = 0.0f;
+        for (int i = 0; i < D; ++i) new_lambda += v[i] * work[i];
+        // Normalize work -> next v.
+        float nw = 0;
+        for (int i = 0; i < D; ++i) nw += work[i] * work[i];
+        nw = std::sqrt(nw) + 1e-12f;
+        for (int i = 0; i < D; ++i) v[i] = work[i] / nw;
+        if (std::fabs(new_lambda - lambda) < 1e-6f * (1.0f + std::fabs(new_lambda))) {
+            lambda = new_lambda;
+            break;
+        }
+        lambda = new_lambda;
+    }
+
+    // Store eigenvector (column k). The buffer is D×max_candidates
+    // (column-major: column k lives at [k*D, (k+1)*D)).
+    for (int i = 0; i < D; ++i) evecs[(size_t)k * D + i] = v[i];
+    evals[k] = lambda;
+
+    // Deflate: C ← C − λ·v·vᵀ  (removes the found direction).
+    for (int i = 0; i < D; ++i) {
+        float* Ci = C.data() + (size_t)i * D;
+        for (int j = 0; j < D; ++j) Ci[j] -= lambda * v[i] * v[j];
     }
 }
 
@@ -115,29 +117,30 @@ XFactor::XFactor(const float* embed_tokens, int vocab, int dim, double variance_
         throw std::runtime_error("XFactor: covariance has zero variance");
     }
 
-    // r = number of top eigenvalues needed to reach variance_tau of the trace.
-    // The eigenvalues are descending by construction of power iteration.
-    int r = 1;
-    // Greedy: keep adding the dominant eigenvalues (power iteration returns the
-    // top ones first). We don't know the exact cutoff a priori, so we compute
-    // a batch and check. Use up to dim/2 candidates (dim is typically 2048).
-    const int max_candidates = dim;  // all, but each is cheap (O(D²) each)
-    std::vector<float> evals(max_candidates), evecs;
-    power_eigh_topk(C, dim, max_candidates, evals, evecs);
-
+    // 4. Compute the top-r eigenpairs INCREMENTALLY (O(D²·r)) — the Madhava
+    //    principle: prune with a bound, stop once the variance target is met
+    //    OR once the remaining eigenvalues are negligible (tail decayed).
+    //    This is the O(D²r) path documented in XFACTOR_MATHEMATICS.md — it
+    //    stops early for low-rank manifolds instead of the O(D³) full eigh.
+    const int max_candidates = dim;  // ceiling = dim (the variance decides)
+    std::vector<float> evals(max_candidates), evecs((size_t)dim * max_candidates);
     double acc = 0.0;
+    int r = 0;
     for (r = 0; r < max_candidates; ++r) {
-        acc += std::max(0.0f, evals[r]);
-        if (acc / trace >= variance_tau) break;
+        power_eigh_next(C, dim, r, evals, evecs);
+        acc += std::max(0.0, (double)evals[r]);
+        if (acc / trace >= variance_tau) break;                       // target met
+        if (evals[r] < 1e-8 * trace && r > 1) break;                  // tail decayed
     }
     r = std::max(1, r + 1);  // at least one component
     variance_captured_ = acc / trace;
 
-    // 5. X = top-r eigenvectors (columns of evecs, which is D×max_candidates).
+    // 5. X = top-r eigenvectors (columns of evecs, D×max_candidates).
+    //    evecs is column-major (column j at [j*D, (j+1)*D)).
     X_.resize((size_t)dim * r);
     for (int j = 0; j < r; ++j) {
         for (int i = 0; i < dim; ++i) {
-            X_[(size_t)i * r + j] = evecs[(size_t)i * max_candidates + j];
+            X_[(size_t)i * r + j] = evecs[(size_t)j * dim + i];
         }
     }
 

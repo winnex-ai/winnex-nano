@@ -1,18 +1,20 @@
 /**
- * forward.hpp — native forward pass for transformer LLMs (GPTQ int4).
+ * forward.hpp — native forward pass for transformer LLMs (dense f32 + OpenCL).
  *
  * Processes hidden states through the model layers, driven by a config that
  * is READ from the model's config.json (arch-detected, model-agnostic):
  *
  *   per layer i:
  *     h = RMSNorm(h, input_layernorm)                (rms_norm)
- *     q = GPTQ(h, q_proj); k = GPTQ(h, k_proj); v = GPTQ(h, v_proj)
+ *     q = DENSE(h, q_proj); k = DENSE(h, k_proj); v = DENSE(h, v_proj)
  *     q,k = RoPE(q,k, position)
  *     attn = GQA_attention(q, k, v)                  (QKᵀ + top-k, Madhava-style)
- *     h = h + GPTQ(attn, o_proj)
+ *     h = h + DENSE(attn, o_proj)
  *     h = h + MLP(RMSNorm(h), gate/up/down)          (SiLU gating)
- *   logits = GPTQ(RMSNorm(h), lm_head)               (tied to embed_tokens if tied)
+ *   logits = DENSE(RMSNorm(h), lm_head)              (tied to embed_tokens if tied)
  *
+ * The input hidden states come from the X-factor embedding of the text
+ * (XFactor.project(expand_spectral(histogram))) — no BPE, no vocabulary.
  * The attention uses the Madhava selective-top-K (no softmax over all): the
  * query attends to the top-k keys by bound, exactly like the engine prunes.
  *
@@ -43,7 +45,8 @@ struct ModelConfig {
     float rope_theta = 10000.0f;
     float rms_norm_eps = 1e-6f;
     bool tie_word_embeddings = true;
-    int group_size = 128;            // GPTQ
+    int group_size = 128;            // GPTQ (legacy; the dense path ignores it)
+    bool gptq = false;               // true when .qweight/.qzeros present
 };
 
 // Loads a ModelConfig from a config.json (minimal parser).

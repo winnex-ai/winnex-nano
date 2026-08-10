@@ -57,6 +57,7 @@ add_library(winnex_nano
     src/stream_engine.cpp
     src/x_factor.cpp
     src/safetensors.cpp
+    src/forward.cpp
 )
 target_include_directories(winnex_nano PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(winnex_nano PUBLIC madhava_reused)
@@ -79,3 +80,17 @@ add_test(NAME spectral_tokenizer COMMAND test_spectral_tokenizer)
 add_executable(test_stream tests/test_stream.cpp)
 target_link_libraries(test_stream PRIVATE winnex_nano)
 add_test(NAME stream COMMAND test_stream)
+
+add_executable(test_x_factor tests/test_x_factor.cpp)
+target_link_libraries(test_x_factor PRIVATE winnex_nano)
+add_test(NAME x_factor COMMAND test_x_factor)
+
+add_executable(test_safetensors tests/test_safetensors.cpp)
+target_link_libraries(test_safetensors PRIVATE winnex_nano)
+add_test(NAME safetensors COMMAND test_safetensors)
+
+# test_forward requires a model dir (config.json + model.safetensors); the
+# test is registered but the model is passed via command line (not a CTest
+# arg — run it manually with `./test_forward <model_dir> <prompt>`).
+add_executable(test_forward tests/test_forward.cpp)
+target_link_libraries(test_forward PRIVATE winnex_nano)

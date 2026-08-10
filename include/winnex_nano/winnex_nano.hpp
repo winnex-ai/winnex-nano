@@ -104,10 +104,10 @@ void rope_apply(float* x, int seq_pos, int head_dim, int n_heads,
                 float rope_theta);
 void silu_gate_mul(float* out, const float* gate, const float* up, int n);
 
-// GPTQ int4 dequant + matmul: y[out] = sum_in x[in] * W_gptq[out][in]
-void gptq_matmul(float* y, const float* x, const uint8_t* qweight,
-                 const uint8_t* qzeros, const float* scales, const int* g_idx,
-                 int in_dim, int out_dim, int group_size);
+// Dense f32 matmul: y[out] = sum_in x[in] * W[out][in] (native, AVX2/OpenMP).
+// This is the Winnex-native dense path — no GPTQ, no CUDA.
+void dense_matmul(float* y, const float* x, const float* W,
+                  int in_dim, int out_dim);
 
 // ---------------------------------------------------------------------------
 // Weight balancer — the Winnex-derived multimodel blending:

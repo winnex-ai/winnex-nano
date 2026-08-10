@@ -25,11 +25,12 @@ void rope_apply(float* x, int seq_len, int n_heads, int head_dim, float rope_the
 // SiLU (silu(x) = x·sigmoid(x)), in place.
 void silu_inplace(float* x, int n);
 
-// GPTQ int4 dequant + matmul: y[out] = x[in] · W (W int4-packed, group_size).
-// qweight shape [in/8, out] int32-packed; qzeros [out/gs, in/8]; scales [out/gs, out].
-void gptq_matmul(float* y, const float* x, const std::uint8_t* qweight,
-                 const std::uint8_t* qzeros, const float* scales,
-                 const std::int32_t* g_idx, int in_dim, int out_dim, int group_size);
+// Dense float32 matmul (row-major): y[out] = x[in] · W[out][in].
+// W is row-major [out_dim, in_dim]. This is the native dense path for
+// non-quantized models (f32/f16/bf16 safetensors). AVX2/FMA when available,
+// OpenMP-parallel over the output rows.
+void dense_matmul(float* y, const float* x, const float* W,
+                  int in_dim, int out_dim);
 
 } // namespace winnex_nano
 

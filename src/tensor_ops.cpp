@@ -4,6 +4,10 @@
 #include <cmath>
 #include <cstddef>
 
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
+
 namespace winnex_nano {
 
 void rms_norm(float* y, const float* x, const float* weight, int n, int d,
@@ -43,45 +47,33 @@ void silu_inplace(float* x, int n) {
     }
 }
 
-void gptq_matmul(float* y, const float* x, const std::uint8_t* qweight,
-                 const std::uint8_t* qzeros, const float* scales,
-                 const std::int32_t* g_idx, int in_dim, int out_dim, int group_size) {
-    // GPTQ int4 packed, desc_act=false layout (the Qwen/Winnex models):
-    //   qweight[out/8][in]      row = output/8, each int32 holds 8 int4
-    //                           weights along the INPUT dim
-    //   qzeros[out/gs][in/8]    zero-points packed per (group, input-block)
-    //   scales[out/gs][in]      scale per (group, input)
-    //   g_idx[in]               per-input group (desc_act=true only; ignored)
-    // For output o, the weight row is o/8 and the nibble within each int32 is
-    // o%8. Each int32 at [row][i] holds the 8 outputs {o/8*8 .. o/8*8+7} for
-    // input i. So for output o and input i:
-    //   w[o][i] = nibble(o%8) of qweight[o/8][i]
-    //   z[grp][i] = nibble(o%8) of qzeros[grp][i/8]
-    //   scale[grp][i]
-    //   acc[o] += x[i] * (w - z) * scale
-    const int packed_in = in_dim / 8;
-    const int groups = out_dim / group_size;
-    const int shift = 0;  // nibble offset varies by output
-
+void dense_matmul(float* y, const float* x, const float* W,
+                  int in_dim, int out_dim) {
+    // Row-major: y[o] = Σ_i x[i] · W[o*in_dim + i], for o in [0, out_dim).
+    // AVX2/FMA: process 8 in_dim elements per iteration (FMA), OpenMP over
+    // the output rows (each row is independent).
+#pragma omp parallel for
     for (int o = 0; o < out_dim; ++o) {
-        const int row = o >> 3;
-        const int nib = o & 7;
-        const int sh = nib * 4;
-        int grp = o / group_size;  // desc_act=false: group by output position
-        const std::int32_t* wrow = reinterpret_cast<const std::int32_t*>(qweight)
-                                   + (size_t)row * in_dim;
-        const std::int32_t* zbase = reinterpret_cast<const std::int32_t*>(qzeros)
-                                    + (size_t)grp * packed_in;
-        const float* srow = scales + (size_t)grp * in_dim;
-
-        float acc = 0.0f;
-        for (int i = 0; i < in_dim; ++i) {
-            int wi = (wrow[i] >> sh) & 0xF;
-            int zi = (zbase[i >> 3] >> sh) & 0xF;
-            int v = wi - zi;
-            acc += x[i] * (v * srow[i]);
+        const float* wrow = W + (size_t)o * in_dim;
+#if defined(__AVX2__) && defined(__FMA__)
+        __m256 acc = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 8 <= in_dim; i += 8) {
+            __m256 xv = _mm256_loadu_ps(x + i);
+            __m256 wv = _mm256_loadu_ps(wrow + i);
+            acc = _mm256_fmadd_ps(xv, wv, acc);
         }
-        y[o] = acc;
+        float tmp[8];
+        _mm256_storeu_ps(tmp, acc);
+        float s = tmp[0] + tmp[1] + tmp[2] + tmp[3]
+                + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+        for (; i < in_dim; ++i) s += x[i] * wrow[i];
+        y[o] = s;
+#else
+        float s = 0.0f;
+        for (int i = 0; i < in_dim; ++i) s += x[i] * wrow[i];
+        y[o] = s;
+#endif
     }
 }
 
