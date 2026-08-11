@@ -45,12 +45,15 @@ from ._winnex_nano import (
     load_config,
 )
 
-# X-Factor model conversion (weights → manifold) — the primary purpose.
-from . import model_converter
-from .model_converter import (
-    compute_model_projector,
-    convert_weights_stream,
-    convert_tensor,
+# Mathematical model fusion / conversion (replaces the refuted W·P projection).
+from . import model_fusion
+from .model_fusion import (
+    linear_merge,
+    slerp_merge,
+    ties_merge,
+    dare_merge,
+    lora_adapter,
+    quantize,
 )
 
 __version__ = "0.1.7"
@@ -73,9 +76,12 @@ __all__ = [
     "dense_matmul",
     "rms_norm",
     "load_config",
-    "compute_model_projector",
-    "convert_weights_stream",
-    "convert_tensor",
-    "model_converter",
+    "linear_merge",
+    "slerp_merge",
+    "ties_merge",
+    "dare_merge",
+    "lora_adapter",
+    "quantize",
+    "model_fusion",
     "__version__",
 ]
