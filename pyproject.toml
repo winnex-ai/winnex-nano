@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "winnex-nano"
-version = "0.1.9"
+version = "0.1.10"
 description = "Native Winnex inference engine — deterministic spectral tokenizer, multimodel weight balancing, and chunk streaming via the Madhava fast build. Model-agnostic (Qwen/BERT/DeepSeek/GPT), OpenCL, no CUDA."
 readme = "README.md"
 requires-python = ">=3.8"
