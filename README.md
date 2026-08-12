@@ -67,6 +67,12 @@ curl -N http://localhost:30002/v1/chat/completions \
 
 ## Honest benchmark (vs BPE)
 
+Run the full benchmark on Kaggle — installs `winnex-nano` from PyPI and
+reports round-trip, throughput and O(1) decode scaling on real multilingual
+text:
+
+[![Kaggle](https://img.shields.io/badge/Kaggle-Spectral%20Tokenizer%20benchmark-20BEFF?logo=kaggle)](https://www.kaggle.com/code/kleniopadilha/winnex-nano-benchmark-spectral)
+
 | Metric | winnex-nano spectral | BPE (Qwen2.5) |
 |--------|---------------------|---------------|
 | Round-trip perfect | 8/8 | n/a |
