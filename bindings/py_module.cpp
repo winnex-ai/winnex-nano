@@ -58,6 +58,8 @@ PYBIND11_MODULE(_winnex_nano, m) {
         }, py::arg("data"))
         .def("encode_histogram", &SpectralTokenizer::encode_histogram,
              py::arg("text"), py::arg("bins") = 256)
+        .def("encode_compact", &SpectralTokenizer::encode_compact, py::arg("text"))
+        .def("decode_compact", &SpectralTokenizer::decode_compact, py::arg("states"))
         .def("decode", &SpectralTokenizer::decode, py::arg("states"))
         .def("decode_fft", &SpectralTokenizer::decode_fft, py::arg("states"))
         .def("decode_array",

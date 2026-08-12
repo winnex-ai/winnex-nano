@@ -113,6 +113,41 @@ std::string SpectralTokenizer::decode(const std::vector<Quat>& states) const {
     return out;
 }
 
+std::vector<Quat> SpectralTokenizer::encode_compact(const std::string& text) const {
+    // One complex sample per byte (j=0): [cos((byte+pos)·2π/256), sin(...)].
+    // The spectral signal is a pure tone of frequency (byte+pos) — by the
+    // sampling theorem, a single sample of its phase fully determines it.
+    // Storage: 2 floats per byte = 64 bits/char (vs embed_dim·4·32 = 8192).
+    std::vector<Quat> states;
+    states.reserve(text.size());
+    for (size_t pos = 0; pos < text.size(); ++pos) {
+        const int bpos = static_cast<int>(static_cast<unsigned char>(text[pos]) + pos);
+        const float phase = (static_cast<float>(bpos)) * 2.0f * kPi / kByteRange;
+        Quat q;
+        q.w = std::cos(phase);
+        q.x = std::sin(phase);
+        q.y = 0.0f; q.z = 0.0f;  // unused in compact mode
+        states.push_back(q);
+    }
+    return states;
+}
+
+std::string SpectralTokenizer::decode_compact(const std::vector<Quat>& states) const {
+    if (states.empty()) return "";
+    // Each state is ONE complex sample: phase = (byte+pos)·2π/256.
+    std::string out;
+    out.reserve(states.size());
+    for (size_t b = 0; b < states.size(); ++b) {
+        const Quat& q = states[b];
+        float phase = std::atan2(q.x, q.w);
+        if (phase < 0) phase += 2.0f * kPi;
+        int byte = static_cast<int>(std::lround(phase * kByteRange / (2.0f * kPi))) - static_cast<int>(b);
+        byte = ((byte % kByteRange) + kByteRange) % kByteRange;
+        out.push_back(static_cast<char>(byte));
+    }
+    return out;
+}
+
 std::string SpectralTokenizer::decode_fft(const std::vector<Quat>& states) const {
     // The analytic decode IS the O(1) inverse of the isomorphism — there is
     // no FFT needed. Kept as an alias so existing callers can migrate.

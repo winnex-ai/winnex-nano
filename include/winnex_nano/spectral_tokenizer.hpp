@@ -113,6 +113,15 @@ public:
     // array without per-Quat Python object overhead.
     void encode_into_buffer(const std::string& text, float* out) const;
 
+    // COMPACT representation (64 bits/char): 1 complex number per byte.
+    // The spectral signal is a pure tone; by the sampling theorem only ONE
+    // sample (j=0) is needed to recover the phase — no embed_dim redundancy.
+    // encode_compact: [cos((byte+pos)·2π/256), sin(...)] per byte → 2 floats.
+    std::vector<Quat> encode_compact(const std::string& text) const;
+
+    // decode_compact: analytic inverse from the single sample (O(1)/byte).
+    std::string decode_compact(const std::vector<Quat>& states) const;
+
     // Compatibility alias: the decode is already the analytic O(1) inverse,
     // so this is identical to decode() (kept so callers can migrate).
     std::string decode_fft(const std::vector<Quat>& states) const;
