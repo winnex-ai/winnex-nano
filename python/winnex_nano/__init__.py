@@ -56,7 +56,7 @@ from .model_fusion import (
     quantize,
 )
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 __all__ = [
     "Quat",
