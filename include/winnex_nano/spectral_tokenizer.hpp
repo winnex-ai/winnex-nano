@@ -66,10 +66,25 @@ inline Quat unit_quaternion(float theta, float omega, float phi) {
 inline Quat quat_conj(const Quat& q) { return {q.w, -q.x, -q.y, -q.z}; }
 
 /**
- * SpectralTokenizer — deterministic character ↔ quaternion-spectrum mapping.
+ * SpectralTokenizer — deterministic byte ↔ unit-circle isomorphism.
  *
- * embed_dim: number of spectral modes per character (default 64).
- * ascii_range: printable ASCII [32, 126] by default.
+ * The mathematical structure is the group isomorphism
+ *     f : ℤ/256ℤ → μ₂₅₆        (integers mod 256 → 256th roots of unity)
+ *     f(byte) = e^{i·byte·2π/256}
+ *
+ * Encode:  each UTF-8 byte b at position pos maps to the unit complex number
+ *          ψ = e^{i·(byte+pos+j)·2π/256}   (j = spectral mode, amp = 1.0)
+ * Decode:  the inverse homomorphism, evaluated analytically in O(1) per byte:
+ *          byte = arg(ψ) · 256/(2π) − pos − j   (mod 256)
+ *
+ * No FFT, no 256-ref correlation scan, no probe. The decode is the direct
+ * inverse application of the group isomorphism — the fundamental algebra of
+ * the problem, not an engineering acceleration.
+ *
+ * Auto-synchronizing (UTF-8 is byte-oriented), lossless round-trip for ANY
+ * language, and deterministic (closed-form, no training).
+ *
+ * BSL 1.1 | pay@winnex.ai | (c) Winnex Brasil Soluções Empresariais LTDA-ME
  */
 class SpectralTokenizer {
 public:
@@ -77,7 +92,8 @@ public:
         : embed_dim_(embed_dim) {}
 
     // Encodes a text into a sequence of quaternion states [seq_len, embed_dim].
-    // Each character produces embed_dim quaternions (the spectral modes).
+    // Each UTF-8 byte (0-255) at position pos produces embed_dim pure-phase
+    // modes:  ψ[j] = e^{i·(byte+pos+j)·2π/256}  (amplitude 1.0 — phase only).
     std::vector<Quat> encode(const std::string& text) const;
 
     // Encodes a text into a DISCRIMINATIVE character histogram (normalized).
@@ -86,11 +102,24 @@ public:
     // This is the text representation projected onto the model manifold (X factor).
     std::vector<float> encode_histogram(const std::string& text, int bins = 256) const;
 
-    // Decodes a sequence of quaternion states back to text via the probe
-    // (inner product + exp + normalize + argmax). Returns the best-guess text.
+    // Decodes a sequence of quaternion states back to text via the INVERSE
+    // GROUP HOMOMORPHISM:  byte = arg(ψ)·256/(2π) − pos − j (mod 256).
+    // O(1) per byte — no probe, no correlation, no FFT.
     std::string decode(const std::vector<Quat>& states) const;
 
+    // Batch encode into a CONTIGUOUS float buffer [n_bytes, embed_dim, 4].
+    // Writes w,x,y,z for every mode. The caller owns the buffer (size
+    // n_bytes*embed_dim*4). Used by the Python binding to return a numpy
+    // array without per-Quat Python object overhead.
+    void encode_into_buffer(const std::string& text, float* out) const;
+
+    // Compatibility alias: the decode is already the analytic O(1) inverse,
+    // so this is identical to decode() (kept so callers can migrate).
+    std::string decode_fft(const std::vector<Quat>& states) const;
+
     int embed_dim() const { return embed_dim_; }
+    // Number of byte references (0-255).
+    static constexpr int kByteRange = 256;
 
 private:
     int embed_dim_;

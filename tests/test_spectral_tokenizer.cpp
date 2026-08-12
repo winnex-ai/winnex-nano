@@ -24,6 +24,16 @@ int main() {
         "Winnex spectral tokenizer",
         "A B C 123 !@#",
         "Deterministic round-trip test 456",
+        // pt-BR (bytes > 126 — the historical ASCII-clamp failure).
+        "café",
+        "ação",
+        "não",
+        "português",
+        "Não é possível fazer isso.",
+        // Other UTF-8 scripts (multibyte).
+        "こんにちは",
+        "Привет мир",
+        "مرحبا بالعالم",
     };
 
     for (const auto& s : samples) {
@@ -33,6 +43,13 @@ int main() {
         printf("spectral round-trip: '%s' -> %s [%s]\n",
                s.c_str(), ok ? out.c_str() : "MISMATCH", ok ? "OK" : "FAIL");
         if (!ok) ++failures;
+
+        // decode_fft (the analytic O(1) inverse) must agree with decode().
+        auto out_fft = tok.decode_fft(states);
+        bool ok_fft = (out_fft == s);
+        printf("  decode_fft: '%s' [%s]\n",
+               ok_fft ? out_fft.c_str() : "MISMATCH", ok_fft ? "OK" : "FAIL");
+        if (!ok_fft) ++failures;
     }
 
     // Cross-check: different chars must encode to different spectra.

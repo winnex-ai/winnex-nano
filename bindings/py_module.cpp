@@ -43,9 +43,57 @@ PYBIND11_MODULE(_winnex_nano, m) {
     py::class_<SpectralTokenizer>(m, "SpectralTokenizer")
         .def(py::init<int>(), py::arg("embed_dim") = 64)
         .def("encode", &SpectralTokenizer::encode, py::arg("text"))
+        .def("encode_batch", [](const SpectralTokenizer& self, py::bytes data) {
+            // Encode bytes → numpy array (n, embed_dim, 4) float32.
+            // Avoids per-Quat Python objects: the native buffer is filled in
+            // one call and exposed as a contiguous array.
+            char* buf = nullptr;
+            Py_ssize_t len = 0;
+            PyBytes_AsStringAndSize(data.ptr(), &buf, &len);
+            if (len < 0) throw std::runtime_error("encode_batch: invalid bytes");
+            int embed = self.embed_dim();
+            py::array_t<float> out({(py::ssize_t)len, (py::ssize_t)embed, (py::ssize_t)4});
+            self.encode_into_buffer(std::string(buf, (size_t)len), out.mutable_data());
+            return out;
+        }, py::arg("data"))
         .def("encode_histogram", &SpectralTokenizer::encode_histogram,
              py::arg("text"), py::arg("bins") = 256)
         .def("decode", &SpectralTokenizer::decode, py::arg("states"))
+        .def("decode_fft", &SpectralTokenizer::decode_fft, py::arg("states"))
+        .def("decode_array",
+             [](const SpectralTokenizer& self, py::array_t<float, py::array::c_style | py::array::forcecast> arr) {
+                 auto info = arr.request();
+                 int embed = self.embed_dim();
+                 size_t per = (size_t)embed * 4u;
+                 if ((size_t)info.size % per != 0)
+                     throw std::runtime_error("decode_array: array size must be a multiple of embed_dim*4");
+                 const float* p = (const float*)info.ptr;
+                 size_t n = (size_t)info.size / per;
+                 std::vector<Quat> states;
+                 states.reserve(n * (size_t)embed);
+                 for (size_t i = 0; i < n * (size_t)embed; ++i) {
+                     const float* q = p + i * 4u;
+                     states.push_back(Quat{q[0], q[1], q[2], q[3]});
+                 }
+                 return self.decode(states);
+             }, py::arg("states"))
+        .def("decode_array_fft",
+             [](const SpectralTokenizer& self, py::array_t<float, py::array::c_style | py::array::forcecast> arr) {
+                 auto info = arr.request();
+                 int embed = self.embed_dim();
+                 size_t per = (size_t)embed * 4u;
+                 if ((size_t)info.size % per != 0)
+                     throw std::runtime_error("decode_array_fft: array size must be a multiple of embed_dim*4");
+                 const float* p = (const float*)info.ptr;
+                 size_t n = (size_t)info.size / per;
+                 std::vector<Quat> states;
+                 states.reserve(n * (size_t)embed);
+                 for (size_t i = 0; i < n * (size_t)embed; ++i) {
+                     const float* q = p + i * 4u;
+                     states.push_back(Quat{q[0], q[1], q[2], q[3]});
+                 }
+                 return self.decode_fft(states);
+             }, py::arg("states"))
         .def_property_readonly("embed_dim", &SpectralTokenizer::embed_dim);
 
     py::class_<BlendWeight>(m, "BlendWeight")

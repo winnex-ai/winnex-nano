@@ -13,6 +13,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ============================================================================
 find_package(OpenMP REQUIRED)
 
+# The spectral tokenizer's decode is the ANALYTIC inverse of the group
+# isomorphism ℤ/256ℤ → μ₂₅₆ (O(1) per byte). No FFT, no correlation scan,
+# no external dependency — the decode is pure arithmetic (atan2 + mod).
+
 if(NOT DEFINED MADHAVA_ROOT)
     set(MADHAVA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../winnex-madhava")
 endif()
@@ -66,31 +70,43 @@ target_link_libraries(winnex_nano PUBLIC madhava_reused)
 # scikit-build-core sets up Python3_ROOT_DIR / Python_EXECUTABLE in the build
 # environment; pybind11's pybind11_add_module resolves the interpreter without
 # us requiring Development/Development.Embed (which manylinux lacks).
-find_package(pybind11 CONFIG REQUIRED)
-pybind11_add_module(_winnex_nano bindings/py_module.cpp)
-target_link_libraries(_winnex_nano PRIVATE winnex_nano)
-install(TARGETS _winnex_nano DESTINATION ${SKBUILD_PLATLIB_DIR})
+option(WINNEX_NANO_BUILD_PYTHON "Build the pybind11 Python module" ON)
+if(WINNEX_NANO_BUILD_PYTHON)
+    find_package(pybind11 CONFIG REQUIRED)
+    pybind11_add_module(_winnex_nano bindings/py_module.cpp)
+    target_link_libraries(_winnex_nano PRIVATE winnex_nano)
+    # Install the extension INSIDE the package dir (python/winnex_nano → the
+    # wheel's winnex_nano/), so `from ._winnex_nano import ...` resolves.
+    # SKBUILD_PLATLIB_DIR is the wheel root; the package lives in its
+    # `winnex_nano` subdirectory.
+    if(DEFINED SKBUILD_PLATLIB_DIR)
+        install(TARGETS _winnex_nano DESTINATION ${SKBUILD_PLATLIB_DIR}/winnex_nano)
+    endif()
+endif()
 
 # --- Tests -----------------------------------------------------------------
-enable_testing()
-add_executable(test_spectral_tokenizer tests/test_spectral_tokenizer.cpp)
-target_link_libraries(test_spectral_tokenizer PRIVATE winnex_nano)
-add_test(NAME spectral_tokenizer COMMAND test_spectral_tokenizer)
+option(WINNEX_NANO_BUILD_TESTS "Build the C++ tests" ON)
+if(WINNEX_NANO_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_spectral_tokenizer tests/test_spectral_tokenizer.cpp)
+    target_link_libraries(test_spectral_tokenizer PRIVATE winnex_nano)
+    add_test(NAME spectral_tokenizer COMMAND test_spectral_tokenizer)
 
-add_executable(test_stream tests/test_stream.cpp)
-target_link_libraries(test_stream PRIVATE winnex_nano)
-add_test(NAME stream COMMAND test_stream)
+    add_executable(test_stream tests/test_stream.cpp)
+    target_link_libraries(test_stream PRIVATE winnex_nano)
+    add_test(NAME stream COMMAND test_stream)
 
-add_executable(test_x_factor tests/test_x_factor.cpp)
-target_link_libraries(test_x_factor PRIVATE winnex_nano)
-add_test(NAME x_factor COMMAND test_x_factor)
+    add_executable(test_x_factor tests/test_x_factor.cpp)
+    target_link_libraries(test_x_factor PRIVATE winnex_nano)
+    add_test(NAME x_factor COMMAND test_x_factor)
 
-add_executable(test_safetensors tests/test_safetensors.cpp)
-target_link_libraries(test_safetensors PRIVATE winnex_nano)
-add_test(NAME safetensors COMMAND test_safetensors)
+    add_executable(test_safetensors tests/test_safetensors.cpp)
+    target_link_libraries(test_safetensors PRIVATE winnex_nano)
+    add_test(NAME safetensors COMMAND test_safetensors)
 
-# test_forward requires a model dir (config.json + model.safetensors); the
-# test is registered but the model is passed via command line (not a CTest
-# arg — run it manually with `./test_forward <model_dir> <prompt>`).
-add_executable(test_forward tests/test_forward.cpp)
-target_link_libraries(test_forward PRIVATE winnex_nano)
+    # test_forward requires a model dir (config.json + model.safetensors); the
+    # test is registered but the model is passed via command line (not a CTest
+    # arg — run it manually with `./test_forward <model_dir> <prompt>`).
+    add_executable(test_forward tests/test_forward.cpp)
+    target_link_libraries(test_forward PRIVATE winnex_nano)
+endif()
