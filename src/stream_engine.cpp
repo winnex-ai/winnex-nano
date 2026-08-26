@@ -92,15 +92,20 @@ std::string StreamEngine::stream(
             cfg.modulation = true;
             cfg.postfilter = true;
             cfg.normalize_input = true;
-            cfg.early_exit = true;
+            // BUG FIX (P0, mirrors winnex-madhava 1.9.3): early_exit must be
+            // OFF. Forcing it True degraded recall to 0.73 in dim >= 384
+            // because the modulated bound does not order like the exact score
+            // when the bound is loose (curse of dimensionality). The safe
+            // default is early_exit off (exact post-filter), which
+            // guarantees recall = 1.0.
+            cfg.early_exit = false;
             engine = std::make_unique<winnex_madhava::MadhavaL2>(cfg);
-            // uint8 corpus: quantize [-1,1] normalized floats to [0,255].
-            std::vector<uint8_t> u8(flat.size());
-            for (size_t i = 0; i < flat.size(); ++i) {
-                float v = (flat[i] + 1.0f) * 127.5f;
-                u8[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
-            }
-            engine->build(u8.data(), n);
+            // BUG FIX (G2b): pass the float32 normalized corpus DIRECTLY via
+            // build_float32 — the Madhava engine's float32 manifold path
+            // preserves cosine exactly. The previous uint8 quantization
+            // (v+1)*127.5 destroyed the [-1,1] embedding domain and degraded
+            // recall even at d=64. No integer offset DC.
+            engine->build_float32(flat.data(), n);
         }
         auto build_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - build_start).count();

@@ -1,0 +1,70 @@
+name: Build and Publish Multi-Python Wheels
+
+# Publish winnex-nano to PyPI with wheels for CPython 3.10, 3.11 and 3.12
+# plus an sdist. Uses cibuildwheel (manylinux) and the PyPI Trusted Publisher
+# (OIDC) — no API token needed.
+#
+#   PyPI Project Name : winnex-nano
+#   Owner             : winnex-ai
+#   Repository name   : winnex-nano
+#   Workflow name     : build-and-publish.yml
+#   Environment name  : publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheels:
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel for cp${{ matrix.python-version }}
+        uses: pypa/cibuildwheel@v2.17
+        with:
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: cp${{ matrix.python-version }}-manylinux_x86_64
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cp${{ matrix.python-version }}
+          path: wheelhouse/*.whl
+
+  build-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build source distribution
+        run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish to PyPI (Trusted Publisher / OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
