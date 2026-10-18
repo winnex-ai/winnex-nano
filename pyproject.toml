@@ -62,5 +62,28 @@ MADHAVA_BUILD_BENCHMARK = "OFF"
 MADHAVA_BUILD_EXAMPLES = "OFF"
 WINNEX_NANO_BUILD_TESTS = "OFF"
 
+[tool.cibuildwheel]
+# Alvos explícitos: CPython 3.10–3.13. Sem esta seção o cibuildwheel usa o
+# default dele, e o CI anterior sobrescrevia com CIBW_BUILD, publicando só
+# cp312-manylinux_x86_64.
+build = "cp310-* cp311-* cp312-* cp313-*"
+skip = "*-musllinux_*"
+# testar cada wheel construído antes de publicar
+test-command = "python -c \"import winnex_nano; print(winnex_nano.__version__)\""
+# o pacote depende de winnex-madhava por wheel; instala para o teste
+test-requires = "numpy"
+build-verbosity = 1
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+
 [tool.setuptools]
 package-dir = { "" = "python" }
