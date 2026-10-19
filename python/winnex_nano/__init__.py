@@ -56,7 +56,14 @@ from .model_fusion import (
     quantize,
 )
 
-__version__ = "0.1.12"
+# A versão vem dos metadados do pacote — fonte única de verdade. Hardcoded,
+# ficava em 0.1.12 enquanto o pacote ia para 0.1.22, e o teste do cibuildwheel
+# (`python -c "print(winnex_nano.__version__)"`) reportava o valor errado.
+try:
+    from importlib.metadata import version as _v
+    __version__ = _v("winnex-nano")
+except Exception:  # rodando a partir do fonte, sem instalar
+    __version__ = "0.0.0+local"
 
 __all__ = [
     "Quat",
