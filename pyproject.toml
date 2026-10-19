@@ -1,10 +1,13 @@
 [build-system]
-requires = ["scikit-build-core>=0.10", "pybind11>=2.12", "cmake>=3.20", "auditwheel>=5.0", "numpy>=1.20"]
+requires = ["scikit-build-core[pyproject]>=1.0", "pybind11>=2.12", "cmake>=3.20", "auditwheel>=5.0", "numpy>=1.20"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "winnex-nano"
-version = "0.1.23"
+# A versão vem da tag git, não de um literal. Um valor hardcoded já divergiu do
+# pacote publicado (o __init__ dizia 0.1.12 num pacote 0.1.22), e essa classe
+# de erro é silenciosa: o build passa e o wheel sobe com a versão errada.
+dynamic = ["version"]
 description = "Native Winnex inference engine — deterministic spectral tokenizer, multimodel weight balancing, and chunk streaming via the Madhava fast build. Model-agnostic (Qwen/BERT/DeepSeek/GPT), OpenCL, no CUDA."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -44,6 +47,16 @@ minimum-version = "0.10"
 build-dir = "build/{wheel_tag}"
 cmake.version = ">=3.20"
 wheel.packages = ["python/winnex_nano"]
+
+# Versao a partir da tag git (setuptools-scm via scikit-build-core).
+# `v0.1.23` -> `0.1.23`. Fora de uma tag, gera sufixo de desenvolvimento
+# (ex.: 0.1.24.dev3+gabc1234) em vez de numero fixo — o PyPI recusa esses por
+# padrao, o que e' o comportamento desejado: so se publica a partir de tag.
+# A forma e' `metadata.<campo>` = "provider" (string). Uma tabela com
+# `provider = ...` faz o provider receber settings e abortar com
+# "No inline configuration is supported".
+# sdist.include deve ficar em [tool.scikit-build], nao aqui — dentro desta
+# tabela o TOML o trata como chave de metadata e o sdist sai incompleto.
 sdist.include = [
     "include/**",
     "src/**",
@@ -55,6 +68,12 @@ sdist.include = [
     "benchmark_honesto.py",
     "server_sse.py",
 ]
+
+# Formato do scikit-build-core >= 1.0: uma lista de entradas com `provider`.
+# O provider setuptools_scm rejeita QUALQUER chave extra ("No inline
+# configuration is supported"), entao `provider` precisa ser a unica chave.
+[[tool.dynamic-metadata]]
+provider = "scikit_build_core.metadata.setuptools_scm"
 
 [tool.scikit-build.cmake.define]
 MADHAVA_BUILD_TESTS = "OFF"
