@@ -32,10 +32,14 @@ endif()
 if(NOT EXISTS "${MADHAVA_ROOT}/CMakeLists.txt")
     message(STATUS "winnex-nano: winnex-madhava sources not found locally — fetching from GitHub")
     include(FetchContent)
+    # v1.9.3 e' de agosto e NAO tem as correcoes que destravam macOS e
+    # Windows: flags de SIMD por compilador, OpenMP opcional, e carregamento
+    # dinamico do OpenCL portavel. Fixar numa tag antiga fazia o CI baixar
+    # codigo que nao compila nessas duas plataformas.
     FetchContent_Declare(
         winnex_madhava_src
         GIT_REPOSITORY https://github.com/winnex-ai/winnex-madhava.git
-        GIT_TAG v1.9.3
+        GIT_TAG v1.9.16
     )
     FetchContent_Populate(winnex_madhava_src)
     set(MADHAVA_ROOT "${winnex_madhava_src_SOURCE_DIR}")
