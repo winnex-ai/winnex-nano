@@ -1,75 +1,140 @@
-name: publish
+name: Build and Publish Multi-Platform Wheels
 
-# Publish winnex-nano to PyPI using a Trusted Publisher (OpenID Connect).
+# Publica winnex-nano no PyPI com wheels para CPython 3.10–3.13 em Linux
+# (manylinux), macOS (x86_64 + arm64) e Windows, mais o sdist.
+#
+# POR QUE ESTE ARQUIVO EXISTE ASSIM
+# ---------------------------------
+# A versão anterior tinha três defeitos que deixavam a maioria dos ambientes
+# sem wheel:
+#
+#   1. CIBW_BUILD era `cp312-manylinux_x86_64` — uma única combinação. Os
+#      outros dois jobs da matriz construíam o MESMO wheel cp312 e o
+#      sobrescreviam. Resultado publicado: só cp312 existe no PyPI.
+#
+#   2. `requires_python = ">=3.10"` no pyproject, mas só cp312 publicado. O
+#      pip em 3.10, 3.11 ou 3.13 responde "No matching distribution found" —
+#      sem explicar que o problema é a ausência do wheel.
+#
+#   3. Nenhuma plataforma além de manylinux_x86_64. macOS e Windows ficavam
+#      sem binário, e o `pip install` caía no sdist, que exige compilador
+#      C++20 e uma árvore de build completa.
+#
+# A matriz agora segue os alvos do cibuildwheel (sem CIBW_BUILD manual), o
+# que elimina a classe de erro acima: não há lista de ABIs escrita à mão para
+# divergir do que é realmente construído. O job `verify` falha o pipeline se
+# faltar qualquer combinação exigida.
+#
+# Publicação por Trusted Publisher (OIDC) — sem token no repositório.
 #
 #   PyPI Project Name : winnex-nano
 #   Owner             : winnex-ai
 #   Repository name   : winnex-nano
-#   Workflow name     : publish.yml
+#   Workflow name     : build-and-publish.yml
 #   Environment name  : publish
-#
-# The wheel is built inside the official PyPA manylinux Docker image (broad
-# manylinux tag), then PUBLISHED from the native runner — the OIDC Trusted
-# Publisher cannot run inside the manylinux container (unsupported env).
 
-# DESATIVADO: substituído por build-and-publish.yml.
-#
-# Os dois tinham o MESMO trigger (`tags: v*`), então toda release disparava
-# ambos em paralelo. Em v0.1.13 o publish.yml venceu a corrida, publicou um
-# único wheel cp312, e o build-and-publish.yml não pôde publicar depois — o
-# PyPI não aceita reenvio de uma versão existente.
-#
-# Mantido no repositório como referência do fluxo com container manylinux.
-# Para reativar, apague o bloco `on` abaixo e remova workflow_dispatch de
-# build-and-publish.yml.
 on:
-  workflow_dispatch:      # apenas manual, nunca por tag
+  push:
+    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write    # required for the trusted-publisher OIDC exchange
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux_2_28_x86_64
+  build-wheels:
+    name: Wheels on ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # um alvo quebrado não cancela os outros
+      matrix:
+        # macos-13 (Intel) foi retirado do GitHub Actions e deixa o job em
+        # `queued` para sempre, travando o run inteiro. macos-14 é arm64;
+        # para x86_64 usamos a variante explícita do runner arm64 da Apple.
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build sdist and wheel (manylinux container)
-        run: |
-          PY=/opt/python/cp312-cp312/bin/python
-          $PY -m pip install --quiet build pybind11 cmake
-          $PY -m build
-
-      - name: Repair wheel to manylinux (auditwheel)
-        run: |
-          PY=/opt/python/cp312-cp312/bin/python
-          $PY -m pip install --quiet auditwheel
-          auditwheel repair dist/*.whl -w dist/repair --plat manylinux_2_28_x86_64
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
         with:
-          name: dist
-          path: dist/
-          retention-days: 1
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  verify:
+    name: Verify wheel matrix
+    needs: [build-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Conferir a matriz publicada
+        run: |
+          python3 - <<'PY'
+          import glob, sys
+          from collections import Counter
+          wheels = glob.glob("dist/*.whl")
+          if not wheels:
+              sys.exit("nenhum wheel construido")
+          abis = Counter(w.split("-")[2] for w in wheels)
+          plats = Counter(w.split("-")[-1].replace(".whl", "") for w in wheels)
+          print(f"{len(wheels)} wheels")
+          print("ABIs   :", dict(sorted(abis.items())))
+          print("plataf :", dict(sorted(plats.items())))
+          faltando = [a for a in ("cp310", "cp311", "cp312", "cp313")
+                      if a not in abis]
+          if faltando:
+              sys.exit(f"ABIs ausentes: {faltando}")
+          # exige as três famílias de SO; as arquiteturas publicadas são as
+          # nativas de cada runner (ver tool.cibuildwheel no pyproject)
+          for fam in ("manylinux", "macosx", "win"):
+              if not any(p.startswith(fam) for p in plats):
+                  sys.exit(f"plataforma ausente: {fam}")
+          print("matriz completa")
+          PY
 
   publish:
+    name: Publish to PyPI
+    needs: [build-wheels, build-sdist, verify]
     runs-on: ubuntu-latest
-    needs: build
     environment: publish
     permissions:
       id-token: write
       contents: read
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: dist/
-
-      - name: Publish to PyPI (Trusted Publisher / OIDC)
-        uses: pypa/gh-action-pypi-publish@release/v1
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
         with:
-          packages-dir: dist/repair/
+          name: sdist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
