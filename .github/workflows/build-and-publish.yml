@@ -47,7 +47,10 @@ jobs:
     strategy:
       fail-fast: false          # um alvo quebrado não cancela os outros
       matrix:
-        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+        # macos-13 (Intel) foi retirado do GitHub Actions e deixa o job em
+        # `queued` para sempre, travando o run inteiro. macos-14 é arm64;
+        # para x86_64 usamos a variante explícita do runner arm64 da Apple.
+        os: [ubuntu-latest, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -106,6 +109,8 @@ jobs:
                       if a not in abis]
           if faltando:
               sys.exit(f"ABIs ausentes: {faltando}")
+          # exige as três famílias de SO; as arquiteturas publicadas são as
+          # nativas de cada runner (ver tool.cibuildwheel no pyproject)
           for fam in ("manylinux", "macosx", "win"):
               if not any(p.startswith(fam) for p in plats):
                   sys.exit(f"plataforma ausente: {fam}")

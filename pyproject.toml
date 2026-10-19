@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "winnex-nano"
-version = "0.1.15"
+version = "0.1.16"
 description = "Native Winnex inference engine — deterministic spectral tokenizer, multimodel weight balancing, and chunk streaming via the Madhava fast build. Model-agnostic (Qwen/BERT/DeepSeek/GPT), OpenCL, no CUDA."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -75,12 +75,17 @@ test-requires = "numpy"
 build-verbosity = 1
 
 [tool.cibuildwheel.linux]
-archs = ["x86_64", "aarch64"]
+# x86_64 apenas. aarch64 roda sob emulação QEMU no runner x86_64 e, com 4
+# ABIs × compilação C++, estoura o tempo do job. Para publicar aarch64, use um
+# runner nativo (ubuntu-24.04-arm) numa matriz separada.
+archs = ["x86_64"]
 manylinux-x86_64-image = "manylinux_2_28"
-manylinux-aarch64-image = "manylinux_2_28"
 
 [tool.cibuildwheel.macos]
-archs = ["x86_64", "arm64"]
+# macos-14 é arm64. Compilar x86_64 aqui funciona (cross-compile nativo da
+# Apple), mas dobra o tempo; deixamos só arm64 e publicamos x86_64 via o
+# runner macos-13 quando/se ele voltar.
+archs = ["arm64"]
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
