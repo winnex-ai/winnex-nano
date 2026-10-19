@@ -39,7 +39,7 @@ if(NOT EXISTS "${MADHAVA_ROOT}/CMakeLists.txt")
     FetchContent_Declare(
         winnex_madhava_src
         GIT_REPOSITORY https://github.com/winnex-ai/winnex-madhava.git
-        GIT_TAG v1.9.16
+        GIT_TAG v1.9.17
     )
     FetchContent_Populate(winnex_madhava_src)
     set(MADHAVA_ROOT "${winnex_madhava_src_SOURCE_DIR}")
