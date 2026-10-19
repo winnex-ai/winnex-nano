@@ -46,10 +46,14 @@ if(NOT EXISTS "${MADHAVA_ROOT}/CMakeLists.txt")
 endif()
 message(STATUS "winnex-nano: reusing winnex-madhava at ${MADHAVA_ROOT}")
 
+# speed_opencl.cpp SO entra quando MADHAVA_HAS_OPENCL esta definido (Linux).
+# Sem essa macro, speed_cpu.cpp tambem fornece as implementacoes GPU (pelo
+# #if !defined(MADHAVA_HAS_OPENCL)), e incluir os dois da simbolos duplicados:
+#   LNK2005: bound_stage1_gpu already defined in speed_opencl.obj
+# Foi exatamente o erro de link no runner Windows.
 set(MADHAVA_SRC
     ${MADHAVA_ROOT}/src/winnex_madhava.cpp
     ${MADHAVA_ROOT}/src/speed_cpu.cpp
-    ${MADHAVA_ROOT}/src/speed_opencl.cpp
 )
 add_library(madhava_reused STATIC ${MADHAVA_SRC})
 target_include_directories(madhava_reused PUBLIC ${MADHAVA_ROOT}/include)
@@ -59,6 +63,8 @@ target_include_directories(madhava_reused PRIVATE ${MADHAVA_ROOT}/vendor)
 # plataformas que queremos publicar.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(madhava_reused PRIVATE MADHAVA_HAS_OPENCL)
+    # o fonte correspondente entra junto — macro e fonte andam em par
+    target_sources(madhava_reused PRIVATE ${MADHAVA_ROOT}/src/speed_opencl.cpp)
 endif()
 # Flags de arquitetura por COMPILADOR, não por SO. -mavx2/-mfma são do
 # GCC/Clang; o MSVC usa /arch:AVX2 e não reconhece as outras. E arm64 (Apple
