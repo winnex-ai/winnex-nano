@@ -154,4 +154,82 @@ std::string SpectralTokenizer::decode_fft(const std::vector<Quat>& states) const
     return decode(states);
 }
 
+// ---------------------------------------------------------------------------
+// MODO HRR — agregação coerente com preservação de norma
+// ---------------------------------------------------------------------------
+//
+// Referência: T. Plate, "Holographic reduced representations", IEEE Trans.
+// Neural Networks 6(3), 1995. A construção é a mesma família matemática usada
+// no bound de Cauchy-Schwarz e na atenção sem softmax do Madhava: vetores de
+// fase sobre a esfera unitária, combinados por soma coerente em vez de média
+// (a média destrói a norma por cancelamento).
+//
+// Por que a soma preserva a norma e a média não:
+//
+//   Seja z_i = e^{i·θ_i}, i = 1..n, com θ_i ~ Uniforme(0, 2π) (independentes).
+//   Então:
+//       E[‖Σ z_i‖²] = Σ_i E[|z_i|²] + Σ_{i≠j} E[z_i z̄_j]
+//                   = n + 0            (termos cruzados somem por ortogonalidade)
+//                   = n
+//   A média divide por n:
+//       E[‖(1/n)Σ z_i‖²] = n / n² = 1/n → 0
+//
+//   Ou seja: a soma conserva a energia (‖Z‖² = n), a média a aniquila
+//   (‖Z‖² = 1/n). Para a agregação sobreviver à composição com o X-Factor,
+//   é a soma — modulada por uma base de frequências que torna as posições
+//   distinguíveis — que deve ser usada.
+
+std::vector<float> SpectralTokenizer::encode_hrr(const std::string& text) const {
+    // Uma sequência vazia produz o vetor nulo; o chamador decide o que fazer.
+    const int D = embed_dim_;
+    std::vector<double> re(static_cast<size_t>(D), 0.0);
+    std::vector<double> im(static_cast<size_t>(D), 0.0);
+    if (text.empty() || D <= 0) {
+        return std::vector<float>(re.begin(), re.end());
+    }
+
+    const size_t n = text.size();
+    const double inv_n = 1.0 / static_cast<double>(n);
+
+    for (size_t pos = 0; pos < n; ++pos) {
+        const int b = static_cast<int>(static_cast<unsigned char>(text[pos]));
+        for (int j = 0; j < D; ++j) {
+            // j é FREQUÊNCIA (não offset): cada modo amostra o byte de forma
+            // distinta, e a posição entra com gradiente real.
+            //
+            //   símbolo  s(b)   = e^{i·2π·j·b/256}
+            //   posição  p(pos) = e^{i·2π·j·pos/n}
+            //   vínculo  psi    = s(b)·p(pos) = e^{i·2π·j·(b/256 + pos/n)}
+            const double ang = 2.0 * static_cast<double>(kPi) *
+                               static_cast<double>(j) *
+                               (static_cast<double>(b) / 256.0 +
+                                static_cast<double>(pos) * inv_n);
+            re[static_cast<size_t>(j)] += std::cos(ang);
+            im[static_cast<size_t>(j)] += std::sin(ang);
+        }
+    }
+
+    // Devolve a parte REAL, já dividida por n·sqrt(D) — o fator n mantém a
+    // escala independente do comprimento; sqrt(D) normaliza a soma de D
+    // componentes aleatórias (energia esperada = n·D/2 por componente).
+    const double scale = 1.0 / (static_cast<double>(n) * std::sqrt(static_cast<double>(D)));
+    std::vector<float> out(static_cast<size_t>(D));
+    for (int j = 0; j < D; ++j) {
+        out[static_cast<size_t>(j)] = static_cast<float>(re[static_cast<size_t>(j)] * scale);
+    }
+    return out;
+}
+
+std::vector<float> SpectralTokenizer::encode_hrr_unit(const std::string& text) const {
+    std::vector<float> v = encode_hrr(text);
+    double ss = 0.0;
+    for (float x : v) ss += static_cast<double>(x) * x;
+    const double nrm = std::sqrt(ss);
+    if (nrm > 1e-12) {
+        const double inv = 1.0 / nrm;
+        for (float& x : v) x = static_cast<float>(x * inv);
+    }
+    return v;
+}
+
 } // namespace winnex_nano

@@ -1,0 +1,130 @@
+{
+  "package_version": "0.1.7",
+  "embed_dim": 64,
+  "roundtrip": {
+    "ok": 10,
+    "total": 10,
+    "details": [
+      {
+        "corpus": "ascii_short",
+        "chars": 13,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "ascii_long",
+        "chars": 2250,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "pt_br",
+        "chars": 62,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "pt_br_long",
+        "chars": 2700,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "japanese",
+        "chars": 11,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "russian",
+        "chars": 24,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "arabic",
+        "chars": 21,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "emoji",
+        "chars": 9,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "code",
+        "chars": 32,
+        "match": true,
+        "cer": 0.0
+      },
+      {
+        "corpus": "binary",
+        "chars": 256,
+        "match": true,
+        "cer": 0.0
+      }
+    ]
+  },
+  "throughput": [
+    {
+      "chars": 100,
+      "encode_ms": 0.49,
+      "decode_ms": 0.099,
+      "encode_chars_per_sec": 204140.8,
+      "decode_chars_per_sec": 1006148.8,
+      "roundtrip_ok": true
+    },
+    {
+      "chars": 1000,
+      "encode_ms": 5.959,
+      "decode_ms": 1.084,
+      "encode_chars_per_sec": 167802.2,
+      "decode_chars_per_sec": 922161.5,
+      "roundtrip_ok": true
+    },
+    {
+      "chars": 10000,
+      "encode_ms": 91.162,
+      "decode_ms": 11.958,
+      "encode_chars_per_sec": 109694.7,
+      "decode_chars_per_sec": 836274.8,
+      "roundtrip_ok": true
+    },
+    {
+      "chars": 100000,
+      "encode_ms": 373.839,
+      "decode_ms": 52.039,
+      "encode_chars_per_sec": 267494.9,
+      "decode_chars_per_sec": 1921623.1,
+      "roundtrip_ok": true
+    }
+  ],
+  "compression": {
+    "spectral_bits_per_char": 8623.2,
+    "bpe_bits_per_char_ref": 4.6,
+    "char_bits_per_char_ref": 8.0,
+    "bytes_per_char_quats": 269.47
+  },
+  "scaling": [
+    {
+      "chars": 250000,
+      "encode_ms": 208.19,
+      "decode_ms": 126.62,
+      "encode_chars_per_sec": 1200802.9,
+      "decode_chars_per_sec": 1974407.0,
+      "ns_per_char_decode": 506.5,
+      "roundtrip_ok": true
+    },
+    {
+      "chars": 1000000,
+      "encode_ms": 831.6,
+      "decode_ms": 503.347,
+      "encode_chars_per_sec": 1202506.1,
+      "decode_chars_per_sec": 1986702.7,
+      "ns_per_char_decode": 503.3,
+      "roundtrip_ok": true
+    }
+  ]
+}

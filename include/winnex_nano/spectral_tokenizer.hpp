@@ -126,6 +126,41 @@ public:
     // so this is identical to decode() (kept so callers can migrate).
     std::string decode_fft(const std::vector<Quat>& states) const;
 
+    // ------------------------------------------------------------------
+    // MODO HRR — agregação com preservação de norma (VSA / HRR)
+    // ------------------------------------------------------------------
+    //
+    // O modo acima (encode/encode_compact) é um ISOMORFISMO: 1 byte ↔ 1 fase.
+    // É exato para round-trip, mas NÃO agrega — a fase de cada byte vive em
+    // posições distintas, e uma média simples sofre cancelamento destrutivo
+    // (‖média‖ → 0 com fases aleatórias), violando a conservação de norma.
+    //
+    // O modo HRR (Holographic Reduced Representations, Plate 1995) resolve os
+    // dois problemas:
+    //
+    //   símbolo do byte  :  s(b)   = e^{i·j·b·2π/256}      (j = frequência)
+    //   binding posicional:  p(pos) = e^{i·j·pos·2π/n}
+    //   vínculo           :  psi    = s(b) ⊙ p(pos)
+    //   agregação         :  Z      = Σ_pos psi            (soma COERENTE)
+    //
+    // A diferença para o modo atual é UM caractere na fórmula: no modo atual
+    // o modo espectral j é um OFFSET, `(b + pos + j)`; no HRR, j é FREQUÊNCIA,
+    // `j·(b + pos)`. Com j como offset, todos os modos são rotações constantes
+    // uns dos outros (redundância de D×); com j como frequência, cada modo
+    // amostra o byte de forma distinta e a posição entra com gradiente real.
+    //
+    // Propriedades:
+    //   - Parseval: ‖Z‖² ≤ n²·D, com igualdade para entradas alinhadas. A soma
+    //     coerente conserva a energia; a média a destrói.
+    //   - Ordem preservada: anagramas produzem Z distintos (cos < 0.99).
+    //
+    // ADIÇÃO PURA: nenhum método existente muda de comportamento.
+    std::vector<float> encode_hrr(const std::string& text) const;
+
+    // Idem, normalizado a norma unitária (contrato de cosseno do Madhava).
+    // Devolve `embed_dim()` floats (a parte real do vetor complexo).
+    std::vector<float> encode_hrr_unit(const std::string& text) const;
+
     int embed_dim() const { return embed_dim_; }
     // Number of byte references (0-255).
     static constexpr int kByteRange = 256;

@@ -92,6 +92,11 @@ if(WINNEX_NANO_BUILD_TESTS)
     target_link_libraries(test_spectral_tokenizer PRIVATE winnex_nano)
     add_test(NAME spectral_tokenizer COMMAND test_spectral_tokenizer)
 
+    # HRR: agregação com preservação de norma + NÃO-REGRESSÃO do modo atual
+    add_executable(test_hrr tests/test_hrr.cpp)
+    target_link_libraries(test_hrr PRIVATE winnex_nano)
+    add_test(NAME hrr COMMAND test_hrr)
+
     add_executable(test_stream tests/test_stream.cpp)
     target_link_libraries(test_stream PRIVATE winnex_nano)
     add_test(NAME stream COMMAND test_stream)

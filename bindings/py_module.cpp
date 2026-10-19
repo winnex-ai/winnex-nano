@@ -59,6 +59,12 @@ PYBIND11_MODULE(_winnex_nano, m) {
         .def("encode_histogram", &SpectralTokenizer::encode_histogram,
              py::arg("text"), py::arg("bins") = 256)
         .def("encode_compact", &SpectralTokenizer::encode_compact, py::arg("text"))
+        .def("encode_hrr", &SpectralTokenizer::encode_hrr, py::arg("text"),
+             "HRR (Plate 1995): agrega a sequência num único vetor preservando "
+             "norma (soma coerente) e ordem (binding posicional por frequência). "
+             "Devolve embed_dim floats com a parte real.")
+        .def("encode_hrr_unit", &SpectralTokenizer::encode_hrr_unit, py::arg("text"),
+             "Idem, normalizado a norma unitária (contrato de cosseno do Madhava).")
         .def("decode_compact", &SpectralTokenizer::decode_compact, py::arg("states"))
         .def("decode", &SpectralTokenizer::decode, py::arg("states"))
         .def("decode_fft", &SpectralTokenizer::decode_fft, py::arg("states"))
