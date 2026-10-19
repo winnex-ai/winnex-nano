@@ -12,11 +12,18 @@ name: publish
 # manylinux tag), then PUBLISHED from the native runner — the OIDC Trusted
 # Publisher cannot run inside the manylinux container (unsupported env).
 
+# DESATIVADO: substituído por build-and-publish.yml.
+#
+# Os dois tinham o MESMO trigger (`tags: v*`), então toda release disparava
+# ambos em paralelo. Em v0.1.13 o publish.yml venceu a corrida, publicou um
+# único wheel cp312, e o build-and-publish.yml não pôde publicar depois — o
+# PyPI não aceita reenvio de uma versão existente.
+#
+# Mantido no repositório como referência do fluxo com container manylinux.
+# Para reativar, apague o bloco `on` abaixo e remova workflow_dispatch de
+# build-and-publish.yml.
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+  workflow_dispatch:      # apenas manual, nunca por tag
 
 permissions:
   contents: read

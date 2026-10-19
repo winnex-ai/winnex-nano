@@ -11,7 +11,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # matmul, top-k, selective-top-K attention, quantization, AVX2/OpenMP/OpenCL).
 # The Madhava sources are referenced (not copied) — same files, one build.
 # ============================================================================
-find_package(OpenMP REQUIRED)
+# OpenMP: obrigatório no Linux, opcional em macOS/Windows. O Apple Clang não
+# traz libomp por padrão; exigir quebra o build nos runners macOS.
+find_package(OpenMP)
+if(NOT OpenMP_CXX_FOUND)
+    message(STATUS "winnex-nano: OpenMP não encontrado — build single-thread")
+endif()
 
 # The spectral tokenizer's decode is the ANALYTIC inverse of the group
 # isomorphism ℤ/256ℤ → μ₂₅₆ (O(1) per byte). No FFT, no correlation scan,
@@ -45,11 +50,25 @@ set(MADHAVA_SRC
 add_library(madhava_reused STATIC ${MADHAVA_SRC})
 target_include_directories(madhava_reused PUBLIC ${MADHAVA_ROOT}/include)
 target_include_directories(madhava_reused PRIVATE ${MADHAVA_ROOT}/vendor)
-target_compile_definitions(madhava_reused PRIVATE MADHAVA_HAS_OPENCL)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-    target_compile_options(madhava_reused PRIVATE -O3 -mavx2 -mfma -funroll-loops)
+# OpenCL só no Linux: o macOS removeu os headers no Xcode 12 e o Windows não
+# os traz por padrão. Sem esta guarda, o build falha em duas das três
+# plataformas que queremos publicar.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(madhava_reused PRIVATE MADHAVA_HAS_OPENCL)
 endif()
-target_link_libraries(madhava_reused PUBLIC OpenMP::OpenMP_CXX)
+# Flags de arquitetura por COMPILADOR, não por SO. -mavx2/-mfma são do
+# GCC/Clang; o MSVC usa /arch:AVX2 e não reconhece as outras. E arm64 (Apple
+# Silicon, ARM Windows) não tem AVX2 — aplicar as flags ali quebra o build.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+    if(MSVC)
+        target_compile_options(madhava_reused PRIVATE /O2 /arch:AVX2)
+    else()
+        target_compile_options(madhava_reused PRIVATE -O3 -mavx2 -mfma -funroll-loops)
+    endif()
+endif()
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(madhava_reused PUBLIC OpenMP::OpenMP_CXX)
+endif()
 
 # ============================================================================
 # winnex-nano core (Winnex spectral layer + weight balancer + tensor engine)
