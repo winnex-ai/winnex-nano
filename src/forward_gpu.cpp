@@ -98,9 +98,19 @@ void load_opencl(const std::string& explicit_lib) {
     if (const char* env = std::getenv("WINNEX_OPENCL_LIB")) {
         if (*env) candidates.push_back(env);
     }
-    // Vendor ICD drivers first — loading them registers the platform with the
-    // generic loader. Then the platform loader itself.
-    candidates.push_back("libnvidia-opencl.so.1");
+    //
+    // ORDER MATTERS: the ICD LOADER first, the vendor DRIVER after.
+    //
+    // `libnvidia-opencl.so.1` is a DRIVER, not the ICD loader. It exports the
+    // driver-side entry points but NOT clGetPlatformIDs — those live in the
+    // ICD loader (libOpenCL.so.1 from ocl-icd or the NVIDIA package). Trying
+    // the driver first made dlopen succeed and then every symbol lookup fail:
+    //
+    //     ForwardGpu: OpenCL loader is missing symbols: clGetPlatformIDs ...
+    //
+    // which is exactly what the Kaggle run reported. The driver still has to be
+    // loaded, but via preload_vendor_drivers() AFTER the loader is chosen, so
+    // the loader can register its platform.
     candidates.push_back("libOpenCL.so.1");
     candidates.push_back("libOpenCL.so");
     candidates.push_back("/System/Library/Frameworks/OpenCL.framework/OpenCL");
@@ -110,12 +120,32 @@ void load_opencl(const std::string& explicit_lib) {
     for (const auto& c : candidates) {
         tried.push_back(c);
         h = fg_open(c.c_str());
-        if (h) { g_reason = "loader: " + c; break; }
+        if (!h) continue;
+        // Reject a library that dlopens but cannot resolve the entry point —
+        // i.e. a vendor driver opened by mistake. Trying it and failing later
+        // produces a misleading "missing symbols" error instead of falling
+        // through to the real loader.
+        if (!fg_sym(h, "clGetPlatformIDs")) {
+            tried.back() += " (no clGetPlatformIDs)";
+            h = nullptr;
+            continue;
+        }
+        g_reason = "loader: " + c;
+        break;
     }
+
+    // Load the vendor drivers so the ICD loader can register their platform.
+    // Order: loader first (above), then drivers. On a machine where the ICD
+    // vendor file exists but the driver has not been opened yet, the first
+    // clGetPlatformIDs returns 0 platforms — this is what makes the difference
+    // between "no OpenCL platform" and a working device.
+    fg_open("libnvidia-opencl.so.1");
+    fg_open("libintel-opencl.so.1");
+    fg_open("libamdocl64.so");
     if (!h) {
-        std::string msg = "no OpenCL loader found. Tried:";
+        std::string msg = "no OpenCL ICD loader found. Tried:";
         for (const auto& t : tried) msg += " " + t;
-        msg += ". Set WINNEX_OPENCL_LIB or install an ICD loader (ocl-icd).";
+        msg += ". Set WINNEX_OPENCL_LIB or install ocl-icd / the vendor ICD.";
         g_reason = msg;
         throw std::runtime_error("ForwardGpu: " + msg);
     }
