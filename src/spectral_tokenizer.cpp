@@ -252,49 +252,73 @@ std::vector<float> SpectralTokenizer::encode_hrr_unit(const std::string& text) c
 // parágrafo. É um parâmetro explícito para poder ser varrido.
 void SpectralTokenizer::encode_hrr_into_buffer(const std::string& text, float* out,
                                                double pos_stride) const {
+    // UMA LINHA POR BYTE, não um agregado.
+    //
+    // A primeira versão acumulava Σ_pos dentro do laço e escrevia D pares no
+    // fim — ou seja, produzia o vetor AGREGADO do texto inteiro e o chamava de
+    // matriz. Medido: para um texto de 69 caracteres, a "matriz" tinha a linha
+    // 0 preenchida e 68 linhas de zero, porque cada iteração sobrescrevia o
+    // mesmo buffer. O ForwardEngine recebia uma sequência de 68 vetores nulos.
+    //
+    // A forma correta é ψ[pos] = e^{i·2π·j·(byte/256 + pos·stride)} — a linha
+    // depende do byte E da posição, e é o binding posicional que carrega a
+    // ordem da sequência para dentro do vetor.
     const int D = embed_dim_;
     if (!out || D <= 0) return;
     const size_t n = text.size();
-    std::vector<double> re(static_cast<size_t>(D), 0.0);
-    std::vector<double> im(static_cast<size_t>(D), 0.0);
-
     const double tau = 2.0 * static_cast<double>(kPi);
+    // Escala por 1/sqrt(D): cada linha fica com norma ~1 independente de D.
+    // A posição entra como fase, então textos de tamanhos diferentes continuam
+    // comparáveis — o que NÃO era verdade com o fator 1/n do agregado.
+    const double scale = 1.0 / std::sqrt(static_cast<double>(D));
+
     for (size_t pos = 0; pos < n; ++pos) {
         const double b = static_cast<double>(static_cast<unsigned char>(text[pos]));
         const double p = static_cast<double>(pos) * pos_stride;
+        float* row = out + pos * static_cast<size_t>(D) * 2u;
         for (int j = 0; j < D; ++j) {
-            // j é FREQUÊNCIA: cada modo amostra o byte de forma distinta.
-            const double ang = tau * static_cast<double>(j) * (b / 256.0 + p);
-            re[static_cast<size_t>(j)] += std::cos(ang);
-            im[static_cast<size_t>(j)] += std::sin(ang);
+            // A fase entra por módulo 1 ANTES de multiplicar por 2π. Sem isso,
+            // com D=448 (o valor que casa 2·D com hidden=896), o argumento
+            // chega a ~3000 rad e o `cos` perde precisão relativa. Medido: NaN
+            // em componentes já em 'hello' antes desta redução.
+            double frac = static_cast<double>(j) * (b / 256.0 + p);
+            frac -= std::floor(frac);
+            const double ang = tau * frac;
+            row[static_cast<size_t>(2 * j)]     = static_cast<float>(std::cos(ang) * scale);
+            row[static_cast<size_t>(2 * j + 1)] = static_cast<float>(std::sin(ang) * scale);
         }
-    }
-
-    // Escala por 1/sqrt(n·D): mantém a energia esperada independente de n e D,
-    // que é o que permite comparar textos de tamanhos diferentes.
-    const double scale = (n > 0) ? 1.0 / std::sqrt(static_cast<double>(n) *
-                                                   static_cast<double>(D))
-                                 : 0.0;
-    for (int j = 0; j < D; ++j) {
-        out[static_cast<size_t>(2 * j)]     = static_cast<float>(re[static_cast<size_t>(j)] * scale);
-        out[static_cast<size_t>(2 * j + 1)] = static_cast<float>(im[static_cast<size_t>(j)] * scale);
     }
 }
 
 std::vector<float> SpectralTokenizer::encode_hrr_complex(const std::string& text,
                                                          double pos_stride) const {
+    // AGREGADO: um vetor para o texto inteiro, não uma linha por byte.
+    // É a forma que serve para retrieval (similaridade entre documentos);
+    // `encode_hrr_matrix` é a que serve para o forward (uma linha por token).
+    // As duas usam a MESMA ψ(pos), então um documento e sua matriz são
+    // consistentes: a linha é o termo, o agregado é a soma.
     const int D = embed_dim_;
     std::vector<float> out(static_cast<size_t>(2 * D), 0.0f);
     if (text.empty() || D <= 0) return out;
-    encode_hrr_into_buffer(text, out.data(), pos_stride);
 
-    // Normaliza a norma unitária para o contrato de cosseno do Madhava.
-    double ss = 0.0;
-    for (float x : out) ss += static_cast<double>(x) * x;
-    const double nrm = std::sqrt(ss);
-    if (nrm > 1e-12) {
-        const float inv = static_cast<float>(1.0 / nrm);
-        for (float& x : out) x *= inv;
+    const size_t n = text.size();
+    const double tau = 2.0 * static_cast<double>(kPi);
+    std::vector<double> re(static_cast<size_t>(D), 0.0), im(static_cast<size_t>(D), 0.0);
+    for (size_t pos = 0; pos < n; ++pos) {
+        const double b = static_cast<double>(static_cast<unsigned char>(text[pos]));
+        const double p = static_cast<double>(pos) * pos_stride;
+        for (int j = 0; j < D; ++j) {
+            double frac = static_cast<double>(j) * (b / 256.0 + p);
+            frac -= std::floor(frac);
+            const double ang = tau * frac;
+            re[(size_t)j] += std::cos(ang);
+            im[(size_t)j] += std::sin(ang);
+        }
+    }
+    const double agg = 1.0 / std::sqrt(static_cast<double>(n * (size_t)D));
+    for (int j = 0; j < D; ++j) {
+        out[(size_t)2 * j]     = (float)(re[(size_t)j] * agg);
+        out[(size_t)2 * j + 1] = (float)(im[(size_t)j] * agg);
     }
     return out;
 }

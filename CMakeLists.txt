@@ -89,6 +89,9 @@ add_library(winnex_nano
     src/tensor_ops.cpp
     src/stream_engine.cpp
     src/x_factor.cpp
+    # A ponte entre a codificação sem vocabulário e o espaço de embeddings.
+    # Ver o cabeçalho para o motivo medido (top-1 errado em 4/4 prompts).
+    src/embed_bridge.cpp
     src/safetensors.cpp
     src/forward.cpp
     # OpenCL dense projections for the forward pass. The loader is resolved at

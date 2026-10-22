@@ -43,6 +43,7 @@ from ._winnex_nano import (
     dense_matmul,
     rms_norm,
     load_config,
+    EmbedBridge,
 )
 
 # Mathematical model fusion / conversion (replaces the refuted W·P projection).
@@ -83,6 +84,7 @@ __all__ = [
     "dense_matmul",
     "rms_norm",
     "load_config",
+    "EmbedBridge",
     "linear_merge",
     "slerp_merge",
     "ties_merge",

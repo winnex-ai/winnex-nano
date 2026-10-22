@@ -7,6 +7,7 @@
 #include "winnex_nano/weight_balancer.hpp"
 #include "winnex_nano/stream_engine.hpp"
 #include "winnex_nano/x_factor.hpp"
+#include "winnex_nano/embed_bridge.hpp"
 #include "winnex_nano/safetensors.hpp"
 #include "winnex_nano/forward.hpp"
 #include "winnex_nano/tensor_ops.hpp"
@@ -68,8 +69,8 @@ PYBIND11_MODULE(_winnex_nano, m) {
                                 bool pad_to_max) -> py::object {
             const int embed = self.embed_dim();
             auto encode_one = [&](const std::string& s) -> py::object {
-                py::array_t<float> a({(py::ssize_t)s.size(), (py::ssize_t)embed,
-                                      (py::ssize_t)4});
+                py::array_t<float> a(std::vector<py::ssize_t>{
+                    (py::ssize_t)s.size(), (py::ssize_t)embed, (py::ssize_t)4});
                 self.encode_into_buffer(s, a.mutable_data());
                 return std::move(a);
             };
@@ -95,9 +96,9 @@ PYBIND11_MODULE(_winnex_nano, m) {
             if (!pad_to_max || items.empty())
                 return py::cast((py::ssize_t)items.size());
 
-            py::array_t<float> out({(py::ssize_t)items.size(),
-                                    (py::ssize_t)maxlen,
-                                    (py::ssize_t)embed, (py::ssize_t)4});
+            py::array_t<float> out(std::vector<py::ssize_t>{
+                (py::ssize_t)items.size(), (py::ssize_t)maxlen,
+                (py::ssize_t)embed, (py::ssize_t)4});
             float* base = out.mutable_data();
             const size_t per_text = maxlen * embed * 4;
             for (size_t i = 0; i < items.size(); ++i) {
@@ -112,17 +113,53 @@ PYBIND11_MODULE(_winnex_nano, m) {
         }, py::arg("data"), py::arg("pad_to_max") = true,
            "bytes -> [n, D, 4]; str ou sequência de str -> [batch, max_len, D, 4]")
         // HRR complexo: metade imaginária preservada e posição de taxa fixa.
-        .def("encode_hrr_complex", &SpectralTokenizer::encode_hrr_complex,
-             py::arg("text"), py::arg("pos_stride") = 1.0 / 64.0,
-             "HRR com re/im intercalados (2·embed_dim floats), norma unitária. "
-             "Preserva ordem e usa posição de taxa fixa (independente do "
-             "comprimento do texto).")
+        .def("encode_hrr_complex", [](const SpectralTokenizer& self,
+                                      const std::string& text, double pos_stride) {
+            const int D = self.embed_dim();
+            py::array_t<float> out((py::ssize_t)(2 * D));
+            if (!text.empty()) {
+                std::vector<float> v = self.encode_hrr_complex(text, pos_stride);
+                std::memcpy(out.mutable_data(), v.data(),
+                            v.size() * sizeof(float));
+            } else {
+                std::fill(out.mutable_data(), out.mutable_data() + 2 * D, 0.0f);
+            }
+            return out;
+        }, py::arg("text"), py::arg("pos_stride") = 1.0 / 64.0,
+           "HRR com re/im intercalados (2·embed_dim floats), norma unitária. "
+           "Preserva ordem e usa posição de taxa fixa (independente do "
+           "comprimento do texto).")
         .def("encode_hrr_matrix", [](const SpectralTokenizer& self,
                                      const std::string& text, double pos_stride) {
             // [n_bytes, 2·embed_dim] — a forma que o ForwardEngine consome.
+            //
+            // Duas armadilhas pybind11 nesta funcao, as duas medidas:
+            //
+            // 1. `py::array_t<float> a({n, m})` NAO cria um array 2-D. O
+            //    inicializador `{n, m}` resolve para o construtor de
+            //    std::vector, e o array sai com shape {n, m} — correto — mas
+            //    o mesmo inicializador em outras chamadas (3 elementos) vira
+            //    um shape de 3 dims com tamanho errado. Sempre construir o
+            //    vector explicito.
+            //
+            // 2. Com o buffer preenchido por `mutable_data()` e o objeto
+            //    devolvido por valor, a copia do array_t NAO e garantida como
+            //    no-op; a escrita precisa acontecer no buffer do objeto que
+            //    sera devolvido, e nao numa copia intermediaria.
+            //
+            // O sintoma de acertar a forma mas errar o buffer e corrupcao de
+            // heap visivel como magnitude 1e34 numa unica linha — medido, e
+            // so no binding: /tmp/t.cpp com o mesmo texto dava 0 nao-finitos.
             const int D = self.embed_dim();
-            py::array_t<float> out({(py::ssize_t)text.size(), (py::ssize_t)(2 * D)});
-            self.encode_hrr_into_buffer(text, out.mutable_data(), pos_stride);
+            const py::ssize_t rows = (py::ssize_t)text.size();
+            const py::ssize_t cols = (py::ssize_t)(2 * D);
+            py::array_t<float> out(std::vector<py::ssize_t>{rows, cols});
+            if (rows > 0) {
+                std::vector<float> tmp((size_t)rows * (size_t)cols, 0.0f);
+                self.encode_hrr_into_buffer(text, tmp.data(), pos_stride);
+                std::memcpy(out.mutable_data(), tmp.data(),
+                            tmp.size() * sizeof(float));
+            }
             return out;
         }, py::arg("text"), py::arg("pos_stride") = 1.0 / 64.0,
            "Matriz [n_bytes, 2·embed_dim] pronta para o ForwardEngine.")
@@ -505,6 +542,71 @@ PYBIND11_MODULE(_winnex_nano, m) {
         return py::make_tuple(out, xf.rank(), xf.variance_captured());
     }, py::arg("embed_tokens"), py::arg("vocab"), py::arg("dim"),
        py::arg("variance_tau") = 0.95);
+    // ── EmbedBridge: a ponte codificação → espaço de embeddings ───────────
+    //
+    // Nasceu do gargalo medido: alimentar o ForwardEngine com a codificação
+    // espectral acerta 0 de 4 próximos tokens contra 2 de 4 do BPE. O vetor
+    // está fora da variedade que o modelo aprendeu, e nenhuma projeção
+    // ortogonal o traz para dentro (P = XXᵀ preserva o que recebe).
+    //
+    // Isto é regressão supervisionada, e a API diz isso: `fit` exige alvos.
+    py::class_<EmbedBridge>(m, "EmbedBridge")
+        .def(py::init<>())
+        .def("fit", [](EmbedBridge& self,
+                       py::array_t<float, py::array::c_style | py::array::forcecast> X,
+                       py::array_t<float, py::array::c_style | py::array::forcecast> Y,
+                       double lambda, const std::string& kernel, int n_centers) {
+            auto ix = X.request(); auto iy = Y.request();
+            if (ix.ndim != 2 || iy.ndim != 2)
+                throw py::value_error("fit: X e Y devem ser 2D");
+            if (ix.shape[0] != iy.shape[0])
+                throw py::value_error("fit: X e Y precisam do mesmo número de linhas");
+            EmbedBridge::Kernel k = (kernel == "rbf") ? EmbedBridge::Kernel::Rbf
+                                                      : EmbedBridge::Kernel::Linear;
+            self.fit((const float*)ix.ptr, (const float*)iy.ptr,
+                     (int)ix.shape[0], (int)ix.shape[1], (int)iy.shape[1],
+                     lambda, k, n_centers);
+            return py::make_tuple(self.train_rmse(), self.train_r2());
+        }, py::arg("X"), py::arg("Y"), py::arg("lambda") = 1e-2,
+           py::arg("kernel") = "linear", py::arg("n_centers") = 0,
+           "Ajusta a ponte. Devolve (rmse, r2) de treino.")
+        .def("apply", [](const EmbedBridge& self,
+                         py::array_t<float, py::array::c_style | py::array::forcecast> x) -> py::object {
+            auto ix = x.request();
+            const int n = (ix.ndim == 1) ? 1 : (int)ix.shape[0];
+            if (ix.ndim == 1 && (int)ix.shape[0] != self.in_dim())
+                throw py::value_error("apply: dimensão de entrada não bate");
+            if (ix.ndim == 2 && (int)ix.shape[1] != self.in_dim())
+                throw py::value_error("apply: dimensão de entrada não bate");
+            if (ix.ndim == 1) {
+                py::array_t<float> out((py::ssize_t)self.out_dim());
+                self.apply_batch((const float*)ix.ptr, out.mutable_data(), 1);
+                return py::object(std::move(out));
+            }
+            py::array_t<float> out(std::vector<py::ssize_t>{n, self.out_dim()});
+            self.apply_batch((const float*)ix.ptr, out.mutable_data(), n);
+            return py::object(std::move(out));
+        }, py::arg("x"))
+        .def("apply_matrix", [](const EmbedBridge& self,
+                                py::array_t<float, py::array::c_style | py::array::forcecast> X) {
+            auto ix = X.request();
+            if (ix.ndim != 2 || (int)ix.shape[1] != self.in_dim())
+                throw py::value_error("apply_matrix: espera [n, in_dim]");
+            const int n = (int)ix.shape[0];
+            py::array_t<float> out(std::vector<py::ssize_t>{n, self.out_dim()});
+            self.apply_batch((const float*)ix.ptr, out.mutable_data(), n);
+            return out;
+        }, py::arg("X"), "Aplica a [n, in_dim] e devolve [n, out_dim].")
+        .def("save", &EmbedBridge::save, py::arg("path"))
+        .def_static("load", &EmbedBridge::load, py::arg("path"))
+        .def_property_readonly("fitted", &EmbedBridge::fitted)
+        .def_property_readonly("in_dim", &EmbedBridge::in_dim)
+        .def_property_readonly("out_dim", &EmbedBridge::out_dim)
+        .def_property_readonly("n_samples", &EmbedBridge::n_samples)
+        .def_property_readonly("train_rmse", &EmbedBridge::train_rmse)
+        .def_property_readonly("train_r2", &EmbedBridge::train_r2)
+        .def("__repr__", &EmbedBridge::describe);
+
     m.def("dense_matmul", [](py::array_t<float> x, py::array_t<float> W,
                              int in_dim, int out_dim) {
         py::array_t<float> y(out_dim);
