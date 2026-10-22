@@ -153,6 +153,22 @@ public:
     // enable_gpu() streams one layer at a time instead of failing.
     std::string weight_mode() const;
 
+    /**
+     * Metade do modelo precisa caber no device para o modo `device` valer a
+     * pena. `stream` reenvia TUDO a cada forward, então um modelo grande em
+     * stream não é lento — é impossível: as ativações e a camada corrente
+     * competem com o que já subiu.
+     *
+     * Medido no Qwen2.5-14B (pesos f32 = 49,2 GB, placa 15,48 GB): o modo
+     * `stream` encheu a VRAM até 15.618 MB e falhou com
+     * CL_MEM_OBJECT_ALLOCATION_FAILURE (-4) no prefill. Um modelo que não cabe
+     * no device precisa rodar na CPU, não no device com streaming.
+     */
+    bool device_mode_viable() const;
+
+    /** Por que o device foi recusado (vazio quando não houve recusa). */
+    std::string gpu_refusal() const { return gpu_refusal_; }
+
     /** Bytes of projection weights resident on the device (0 when unused). */
     size_t device_weight_bytes() const;
     // Byte cost of holding every layer resident (float32), and the RAM the
@@ -206,6 +222,7 @@ private:
     bool layers_resident_ = false;
     std::string weight_mode_;   // "cpu" | "resident" | "stream" | "device"
     bool device_weights_ = false;
+    std::string gpu_refusal_;
 
     void load_layer(int layer, LayerWeights& w);
 

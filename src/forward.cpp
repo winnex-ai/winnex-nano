@@ -870,7 +870,8 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
         // Declare the total BEFORE the first upload so bf16-vs-f32 is decided
         // once for the whole model, not per matrix.
         gpu_->declare_weight_bytes((size_t)estimate_resident_bytes());
-        const bool fit = gpu_->weights_fit((size_t)estimate_resident_bytes());
+        const bool fit = gpu_->weights_fit((size_t)estimate_resident_bytes())
+                         && device_mode_viable();
         const bool warmed = fit && warm_device_weights();
         if (const char* dbg = std::getenv("WINNEX_GPU_DEBUG_MODE"))
             std::fprintf(stderr, "[gpu] fit=%d warmed=%d total=%.2fGB dev_total=%.2fGB "
@@ -883,11 +884,25 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
             device_weights_ = true;
             weight_mode_ = "device";
         } else {
-            // The model is too big for the device. Warmup may already have put
-            // some layers there; drop them so every weight lives in exactly one
-            // place and run_layer can still find a host copy of each.
+            // O modelo não cabe no device. Warmup pode já ter subido parte;
+            // liberar garante que cada peso viva em um lugar só.
             gpu_->release_weights();
-            weight_mode_ = "stream";
+            // STREAM só faz sentido se o device ainda for útil para as
+            // ativações. Quando nem metade do modelo cabe, o streaming enche a
+            // VRAM e falha — medido no 14B: 15.618 MB de 15.872 e então -4.
+            // Nesse caso o caminho honesto é CPU, e o motivo fica registrado.
+            if (!device_mode_viable()) {
+                delete gpu_;
+                gpu_ = nullptr;
+                weight_mode_ = "cpu";
+                gpu_refusal_ =
+                    "model does not fit the device even at bf16: " +
+                    std::to_string((long long)(estimate_resident_bytes() / 2 / 1073741824.0 * 10) / 10.0) +
+                    " GB needed, " +
+                    " GB available";
+            } else {
+                weight_mode_ = "stream";
+            }
         }
     }
 }
@@ -951,6 +966,14 @@ bool ForwardEngine::warm_device_weights() {
     } catch (const std::exception&) {
         // Host or device ran out. Partial state is unusable (some layers
         // tagged, some not) so the caller falls back to streaming.
+        //
+        // But what already went up is still holding VRAM, and streaming needs
+        // that VRAM for its activation buffers. Without releasing here the
+        // partial upload poisons the very mode meant to replace it — measured
+        // on the Qwen2.5-14B: the following stream failed with
+        // CL_MEM_OBJECT_ALLOCATION_FAILURE (-4) while ~13 GB of orphaned
+        // weights were still resident on the device.
+        gpu_->release_weights();
         return false;
     }
     return true;
@@ -993,6 +1016,17 @@ double ForwardEngine::available_ram_bytes() {
 
 size_t ForwardEngine::device_weight_bytes() const {
     return gpu_ ? gpu_->device_weight_bytes() : 0;
+}
+
+bool ForwardEngine::device_mode_viable() const {
+    if (gpu_ == nullptr) return false;
+    const size_t avail = gpu_->device_memory_total();
+    if (avail == 0) return true;            // driver não informa; tenta
+    const double bytes_resident = estimate_resident_bytes();
+    // O modo device guarda bf16 quando f32 não cabe. Se nem a metade do f32
+    // couber na placa, o upload vai falhar no meio — recusar é mais honesto
+    // que falhar 20 minutos depois.
+    return bytes_resident * 0.5 <= (double)avail * 0.85;
 }
 
 std::string ForwardEngine::weight_mode() const {

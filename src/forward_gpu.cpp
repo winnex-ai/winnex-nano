@@ -658,7 +658,13 @@ bool ForwardGpu::weights_fit(size_t total_f32_bytes) const {
     if (avail == 0) return true;   // driver will not say; let the upload decide
 
     // 95%, leaving room for activations, the KV cache and the output buffers.
-    const double budget = (double)avail * 0.95;
+    // 85%, não 95%. Medido no Qwen2.5-14B (27,5 GB de pesos, 15,5 GB de placa):
+    // com 95% o motor aceitava a conta de bf16 (13,8 GB) e mesmo assim estourava
+    // com CL_MEM_OBJECT_ALLOCATION_FAILURE (-4) no meio do upload. O que falta
+    // não é só o peso: são as ativações por camada, o cache KV e a fragmentação
+    // do alocador. Uma guarda que aceita e falha depois é pior que uma que
+    // recusa — a falha acontece 20 minutos depois e parece bug de kernel.
+    const double budget = (double)avail * 0.85;
     // The question is "can the engine run this model", not "can it do so in
     // f32". f32 is preferred, but bf16 is the fallback — so a model whose f32
     // form (24.3 GB for the 7B) exceeds a 16 GB card is still viable at bf16
