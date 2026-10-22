@@ -61,6 +61,37 @@ ModelConfig load_config(const std::string& config_path) {
 
     ModelConfig c;
     c.arch = find_str("model_type", "qwen2");
+    //
+    // ARCHITECTURE GATE. This engine implements one family: RMSNorm, RoPE,
+    // SwiGLU, grouped-query attention — Qwen2/Qwen2.5/Qwen3, Llama, Mistral.
+    //
+    // Everything else must be REFUSED here, not loaded and run wrong. The
+    // tensors of GPT-2/BERT are named differently and simply fail to load
+    // (loud, fine). The dangerous case is a model whose tensors DO match but
+    // whose maths differs:
+    //
+    //   gemma2  — GeGLU instead of SwiGLU (gelu(gate)*up), logit softcapping,
+    //             alternating local/global attention with a sliding window.
+    //   gemma3  — same, plus per-head QK-norm already folded differently.
+    //
+    // Those load cleanly and produce plausible-looking perplexity that is
+    // simply wrong. An earlier version of the Kaggle benchmark listed "gemma"
+    // and "gemma2" as supported and would have reported a number for them.
+    {
+        static const char* kSupported[] = {
+            "qwen2", "qwen2_moe", "qwen3", "qwen3_moe",
+            "llama", "mistral", "mixtral", "deepseek_v2", "deepseek_v3",
+        };
+        bool ok = false;
+        for (const char* a : kSupported) if (c.arch == a) { ok = true; break; }
+        if (!ok) {
+            throw std::runtime_error(
+                "ForwardEngine: architecture '" + c.arch + "' is not implemented. "
+                "Supported: qwen2/qwen3/llama/mistral family (RMSNorm, RoPE, "
+                "SwiGLU, GQA). Gemma needs GeGLU + logit softcapping + sliding "
+                "window; it would load and produce a wrong perplexity.");
+        }
+    }
     c.vocab_size = find_int("vocab_size", 0);
     c.hidden_size = find_int("hidden_size", 0);
     c.intermediate_size = find_int("intermediate_size", 0);
