@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <vector>
 
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
@@ -24,16 +25,36 @@ void rms_norm(float* y, const float* x, const float* weight, int n, int d,
 }
 
 void rope_apply(float* x, int seq_len, int n_heads, int head_dim, float rope_theta) {
+    // CONVENTION: "rotate_half" (Qwen2 / Llama / HF), NOT interleaved pairs.
+    //
+    //   half = head_dim/2
+    //   out[j]      = x[j]      * cos(p·inv[j]) - x[j+half] * sin(p·inv[j])
+    //   out[j+half] = x[j+half] * cos(p·inv[j]) + x[j]      * sin(p·inv[j])
+    //
+    // with inv[j] = theta^(-2j/head_dim), j in [0, half).
+    //
+    // The previous version paired (j, j+1) with exponent -2j/head_dim for
+    // j stepping by 2 — a different basis of the same dimension, which
+    // scrambles the rotation. See the note in forward.cpp (run_layer).
+    const int half = head_dim / 2;
+    std::vector<float> cosT((size_t)seq_len * half), sinT((size_t)seq_len * half);
     for (int t = 0; t < seq_len; ++t) {
+        for (int j = 0; j < half; ++j) {
+            const float inv_freq = std::pow(rope_theta, -2.0f * j / (float)head_dim);
+            const float angle = (float)t * inv_freq;
+            cosT[(size_t)t * half + j] = std::cos(angle);
+            sinT[(size_t)t * half + j] = std::sin(angle);
+        }
+    }
+    for (int t = 0; t < seq_len; ++t) {
+        const float* c = cosT.data() + (size_t)t * half;
+        const float* s = sinT.data() + (size_t)t * half;
         for (int h = 0; h < n_heads; ++h) {
             float* head = x + ((size_t)t * n_heads + h) * head_dim;
-            for (int j = 0; j < head_dim; j += 2) {
-                float inv_freq = std::pow(rope_theta, -2.0f * j / head_dim);
-                float angle = t * inv_freq;
-                float c = std::cos(angle), s = std::sin(angle);
-                float a = head[j], b = head[j + 1];
-                head[j] = a * c - b * s;
-                head[j + 1] = a * s + b * c;
+            for (int j = 0; j < half; ++j) {
+                const float a = head[j], b = head[j + half];
+                head[j]        = a * c[j] - b * s[j];
+                head[j + half] = b * c[j] + a * s[j];
             }
         }
     }

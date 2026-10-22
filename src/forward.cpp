@@ -70,7 +70,19 @@ ModelConfig load_config(const std::string& config_path) {
     c.rope_theta = find_float("rope_theta", 10000.0f);
     c.rms_norm_eps = find_float("rms_norm_eps", 1e-6f);
     c.tie_word_embeddings = find_int("tie_word_embeddings", 1) == 1;
-    c.head_dim = c.hidden_size / c.num_attention_heads;
+    // HEAD_DIM: prefer the explicit value from config.json, fall back to
+    // hidden/heads only when it is absent.
+    //
+    // BUG FIX (2026-10-21): this used to ALWAYS derive hidden/heads. Qwen3
+    // decouples the two — Qwen3-4B has hidden=2560, heads=32 (so 2560/32 = 80)
+    // but an explicit head_dim=128, which means q_proj outputs 32*128 = 4096
+    // rows, not 2560. Deriving 80 made every projection reshape wrong, the
+    // attention garbage, and the forward produced perplexity 1.1e7 on a model
+    // that works fine — the logit correlation against transformers was -0.216
+    // on a single token, where attention is trivial and only the dimensions
+    // matter.
+    c.head_dim = find_int("head_dim", 0);
+    if (c.head_dim <= 0) c.head_dim = c.hidden_size / c.num_attention_heads;
     // Legacy GPTQ group size (the dense path ignores it; kept for parity).
     c.group_size = find_int("group_size", 128);
     // The dense native engine is the default. GPTQ is detected at load_layer
@@ -88,6 +100,12 @@ struct ForwardEngine::LayerWeights {
     std::vector<float> post_norm;  // [hidden]
     // Dense f32 QKV projections: W is row-major [out, in].
     std::vector<float> q_w, k_w, v_w, o_w;
+    // QKV BIASES (see the BUG FIX note in load_layer). Qwen2/Qwen2.5 carry
+    // attention biases; Llama does not. Empty when the checkpoint has none.
+    std::vector<float> q_b, k_b, v_b;
+    // PER-HEAD Q/K RMSNorm (Qwen3). Applied over head_dim on each head of Q
+    // and K BEFORE RoPE. Empty for architectures that do not use it.
+    std::vector<float> q_norm, k_norm;
     // Dense f32 MLP.
     std::vector<float> g_w, u_w, d_w;
     // Dims.
@@ -126,6 +144,66 @@ ForwardEngine::ForwardEngine(const ModelConfig& cfg, const Safetensors& st)
 }
 
 namespace {
+// Opt-in switch for the Madhava selective top-k attention path. Default OFF:
+// softmax is what the pretrained weights expect (see the BUG FIX note in
+// run_layer). Set MADHAVA_TOPK_ATTN=1 to measure the delta on a real model.
+bool MadhavaTopKAttn() {
+    static const bool on = [] {
+        const char* v = std::getenv("MADHAVA_TOPK_ATTN");
+        return v != nullptr && v[0] != '0';
+    }();
+    return on;
+}
+
+// ── Selective attention with a CONTROLLED LOST-MASS guarantee ───────────────
+//
+// MADHAVA_TOPK_ATTN=1 enables pruning. Two knobs:
+//
+//   MADHAVA_EPSILON_MASS  (default 1e-4) — the fraction of softmax mass the
+//        pruned keys may account for, at most. This is the quantity that
+//        actually bounds the attention error:
+//
+//            ‖attn_full − attn_pruned‖₁ ≤ 2·(mass of pruned keys)
+//
+//        (each dropped weight is ≤ its own mass, and both weight vectors sum
+//        to 1). So a value ε here is a rigorous bound on how far the layer's
+//        output can move — NOT a heuristic score cut.
+//
+//   MADHAVA_MIN_KEEP      (default 64) — a floor on the number of keys kept,
+//        so short sequences behave like the exact softmax.
+//
+// HOW THE STOPPING TEST WORKS (and an important correction):
+//
+// The natural first instinct is to bound the score with Cauchy-Schwarz —
+// s_i = q·k_i ≤ ‖q‖‖k_i‖ — and stop when exp(‖q‖‖k_i‖ − max)/Z_lower < ε.
+// That bound is SOUND but far too loose to prune anything: measured on
+// Qwen2.5-0.5B layer 0, real scores sit at ~80 while the CS bound is ~1974,
+// a gap of ~1895. The test never fires; every key is kept.
+//
+// It is also unnecessary. Softmax mass is EXACTLY known once the scores are
+// computed, so the pruning decision is made on the true remaining mass rather
+// than on a bound of it. The guarantee is therefore exact, not conservative:
+// the keys we drop, dropped by construction, sum to < ε of the mass.
+//
+// Cost note: computing all scores is O(n·d) — the same work as the full
+// softmax. What this saves is the VALUE accumulation and the weight writes
+// over the selected set, which dominates only when n is large.
+float EpsilonMass() {
+    static const float e = [] {
+        const char* v = std::getenv("MADHAVA_EPSILON_MASS");
+        return (v != nullptr && v[0] != '\0') ? std::atof(v) : 1e-4f;
+    }();
+    return e;
+}
+
+int MinKeep() {
+    static const int k = [] {
+        const char* v = std::getenv("MADHAVA_MIN_KEEP");
+        return (v != nullptr && v[0] != '\0') ? std::atoi(v) : 64;
+    }();
+    return k;
+}
+
 // Loads a dense f32 projection weight (row-major [out, in]).
 // Prefers ".weight" (dense safetensors); falls back to the GPTQ path
 // (".qweight"/".qzeros"/".scales") if the dense weight is absent.
@@ -147,7 +225,11 @@ std::vector<float> load_dense_or_gptq_scales(const Safetensors& st,
 void ForwardEngine::load_layer(int layer, LayerWeights& w) {
     std::string L = "model.layers." + std::to_string(layer) + ".";
     w.hidden = cfg_.hidden_size;
-    w.q_out = cfg_.hidden_size;
+    // q_proj is [num_attention_heads * head_dim, hidden]. With Qwen3's
+    // decoupled head_dim (32*128 = 4096) this is NOT hidden_size (2560):
+    // using hidden_size here under-allocated q and the o_proj matmul read
+    // past the buffer (measured: malloc(): invalid size, SIGABRT).
+    w.q_out = cfg_.num_attention_heads * cfg_.head_dim;
     w.kv_out = cfg_.head_dim * cfg_.num_key_value_heads;
     w.inter = cfg_.intermediate_size;
     w.gs = cfg_.group_size;
@@ -162,6 +244,27 @@ void ForwardEngine::load_layer(int layer, LayerWeights& w) {
     w.k_w = load_dense_or_gptq_scales(*st_, L + "self_attn.k_proj", is_gptq);
     w.v_w = load_dense_or_gptq_scales(*st_, L + "self_attn.v_proj", is_gptq);
     w.o_w = load_dense_or_gptq_scales(*st_, L + "self_attn.o_proj", is_gptq);
+    // BUG FIX (attention bias): Qwen2/Qwen2.5 store a bias on q_proj, k_proj
+    // and v_proj. This loader read only ".weight", so every projection ran
+    // without its bias — and the error compounds over 24 layers. Measured on
+    // Qwen2.5-0.5B: v_proj output differed from the reference by 0.098 for a
+    // single token, and the forward produced perplexity 9.9e6 against 37.4.
+    // Llama has no such bias; the check keeps both architectures correct.
+    auto load_bias = [&](const std::string& base, std::vector<float>& dst) {
+        if (st_->has(base + ".bias")) dst = st_->to_float(st_->get(base + ".bias"));
+        else dst.clear();
+    };
+    auto load_opt = [&](const std::string& base, std::vector<float>& dst) {
+        if (st_->has(base + ".weight")) dst = st_->to_float(st_->get(base + ".weight"));
+        else dst.clear();
+    };
+    load_opt(L + "self_attn.q_norm", w.q_norm);
+    load_opt(L + "self_attn.k_norm", w.k_norm);
+
+    load_bias(L + "self_attn.q_proj", w.q_b);
+    load_bias(L + "self_attn.k_proj", w.k_b);
+    load_bias(L + "self_attn.v_proj", w.v_b);
+
     w.g_w = load_dense_or_gptq_scales(*st_, L + "mlp.gate_proj", is_gptq);
     w.u_w = load_dense_or_gptq_scales(*st_, L + "mlp.up_proj",   is_gptq);
     w.d_w = load_dense_or_gptq_scales(*st_, L + "mlp.down_proj", is_gptq);
@@ -189,34 +292,96 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     std::vector<float> q(seq_len * w.q_out), k(seq_len * w.kv_out), v(seq_len * w.kv_out);
     for (int t = 0; t < seq_len; ++t) {
         const float* xt = hn.data() + (size_t)t * H;
-        dense_matmul(q.data() + (size_t)t * w.q_out, xt, w.q_w.data(), H, w.q_out);
-        dense_matmul(k.data() + (size_t)t * w.kv_out, xt, w.k_w.data(), H, w.kv_out);
-        dense_matmul(v.data() + (size_t)t * w.kv_out, xt, w.v_w.data(), H, w.kv_out);
+        float* qt = q.data() + (size_t)t * w.q_out;
+        float* kt = k.data() + (size_t)t * w.kv_out;
+        float* vt = v.data() + (size_t)t * w.kv_out;
+        dense_matmul(qt, xt, w.q_w.data(), H, w.q_out);
+        dense_matmul(kt, xt, w.k_w.data(), H, w.kv_out);
+        dense_matmul(vt, xt, w.v_w.data(), H, w.kv_out);
+        // Attention biases (Qwen2/Qwen2.5). No-op when the checkpoint has none.
+        if (!w.q_b.empty()) for (int o = 0; o < w.q_out; ++o) qt[o] += w.q_b[o];
+        if (!w.k_b.empty()) for (int o = 0; o < w.kv_out; ++o) kt[o] += w.k_b[o];
+        if (!w.v_b.empty()) for (int o = 0; o < w.kv_out; ++o) vt[o] += w.v_b[o];
     }
 
     // 3. RoPE on Q (all heads) and K (kv heads) at their absolute positions.
     //    Q layout: [t, nh*hd]; K layout: [t, nkv*hd].
-    for (int t = 0; t < seq_len; ++t) {
-        int abs_pos = cache_pos + t;
-        for (int hh = 0; hh < nh; ++hh) {
-            float* hq = q.data() + ((size_t)t * nh + hh) * hd;
-            for (int j = 0; j < hd; j += 2) {
-                float inv = std::pow(cfg_.rope_theta, -2.0f * j / hd);
-                float ang = abs_pos * inv;
-                float c = std::cos(ang), s = std::sin(ang);
-                float a = hq[j], b = hq[j+1];
-                hq[j] = a*c - b*s; hq[j+1] = a*s + b*c;
+    //
+    //    CONVENTION (Qwen2 / Llama / HF "rotate_half"), which is NOT the naive
+    //    interleaved-pair rotation:
+    //
+    //      inv_freq[j] = theta^(-2j/hd)        for j = 0 .. hd/2-1
+    //      out[j]         = x[j]   *cos(p·inv_freq[j]) - x[j+hd/2]*sin(...)
+    //      out[j + hd/2]  = x[j+hd/2]*cos(...)         + x[j]       *sin(...)
+    //
+    //    Two errors this replaces (measured: perplexity 2.5e7 vs 37.4 against
+    //    transformers on Qwen2.5-0.5B — correlation of logits ≈ 0 at every
+    //    position, i.e. the forward did not reproduce the model at all):
+    //
+    //      (a) the exponent used -2j/hd with j stepping by 2 over [0, hd),
+    //          which yields 34 distinct frequencies instead of hd/2 = 32, and
+    //          shifts every frequency by a factor of two (j=2 gave 0.4217
+    //          where the model uses 0.6494);
+    //      (b) the pairs were rotated as (j, j+1) — INTERLEAVED — whereas the
+    //          model pairs element j with element j+hd/2 ("rotate_half").
+    //          Interleaved and rotate_half are different bases of the same
+    //          dimension, so mixing them scrambles the rotation entirely.
+    //
+    //    The precomputed table below is theta-independent per position and is
+    //    cached for the sequence, so the pow()/cos()/sin() are evaluated once
+    //    per (position, frequency) instead of once per (position, head, freq).
+    // PER-HEAD Q/K RMSNorm (Qwen3) — applied over head_dim, per head, BEFORE
+    // RoPE. Without it the attention scores are scaled differently from the
+    // reference: measured on Qwen3-4B, logit correlation was 1.000000 for a
+    // single token (attention trivial, norms irrelevant) and ~0.47 for n>=2 —
+    // exactly the signature of a missing attention-time normalisation.
+    if (!w.q_norm.empty() || !w.k_norm.empty()) {
+        for (int t = 0; t < seq_len; ++t) {
+            for (int hh = 0; hh < nh; ++hh) {
+                float* hq = q.data() + ((size_t)t * nh + hh) * hd;
+                float ss = 0.0f;
+                for (int j = 0; j < hd; ++j) ss += hq[j] * hq[j];
+                const float inv = 1.0f / std::sqrt(ss / hd + cfg_.rms_norm_eps);
+                if (!w.q_norm.empty()) for (int j = 0; j < hd; ++j) hq[j] = hq[j] * inv * w.q_norm[j];
+                else                   for (int j = 0; j < hd; ++j) hq[j] = hq[j] * inv;
+            }
+            for (int hh = 0; hh < nkv; ++hh) {
+                float* hk = k.data() + ((size_t)t * nkv + hh) * hd;
+                float ss = 0.0f;
+                for (int j = 0; j < hd; ++j) ss += hk[j] * hk[j];
+                const float inv = 1.0f / std::sqrt(ss / hd + cfg_.rms_norm_eps);
+                if (!w.k_norm.empty()) for (int j = 0; j < hd; ++j) hk[j] = hk[j] * inv * w.k_norm[j];
+                else                   for (int j = 0; j < hd; ++j) hk[j] = hk[j] * inv;
             }
         }
-        for (int hh = 0; hh < nkv; ++hh) {
-            float* hk = k.data() + ((size_t)t * nkv + hh) * hd;
-            for (int j = 0; j < hd; j += 2) {
-                float inv = std::pow(cfg_.rope_theta, -2.0f * j / hd);
-                float ang = abs_pos * inv;
-                float c = std::cos(ang), s = std::sin(ang);
-                float a = hk[j], b = hk[j+1];
-                hk[j] = a*c - b*s; hk[j+1] = a*s + b*c;
+    }
+
+    {
+        const int half = hd / 2;
+        std::vector<float> cosT((size_t)seq_len * half), sinT((size_t)seq_len * half);
+        for (int t = 0; t < seq_len; ++t) {
+            const int abs_pos = cache_pos + t;
+            for (int j = 0; j < half; ++j) {
+                const float inv = std::pow(cfg_.rope_theta, -2.0f * j / (float)hd);
+                const float ang = (float)abs_pos * inv;
+                cosT[(size_t)t * half + j] = std::cos(ang);
+                sinT[(size_t)t * half + j] = std::sin(ang);
             }
+        }
+        auto rope_apply = [&](float* row, int t) {
+            const float* c = cosT.data() + (size_t)t * half;
+            const float* s = sinT.data() + (size_t)t * half;
+            for (int j = 0; j < half; ++j) {
+                const float x1 = row[j], x2 = row[j + half];
+                row[j]        = x1 * c[j] - x2 * s[j];
+                row[j + half] = x2 * c[j] + x1 * s[j];
+            }
+        };
+        for (int t = 0; t < seq_len; ++t) {
+            for (int hh = 0; hh < nh; ++hh)
+                rope_apply(q.data() + ((size_t)t * nh + hh) * hd, t);
+            for (int hh = 0; hh < nkv; ++hh)
+                rope_apply(k.data() + ((size_t)t * nkv + hh) * hd, t);
         }
     }
 
@@ -236,32 +401,116 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
         for (int hh = 0; hh < nh; ++hh) {
             int kvh = hh / (nh / nkv);  // GQA mapping
             const float* qh = q.data() + ((size_t)t * nh + hh) * hd;
-            // Scores over ctx_len keys (exact attention — the Madhava top-k
-            // selective can replace this; here exact for correctness first).
-            std::vector<std::pair<float,int>> scores;
-            scores.reserve(ctx_len);
-            for (int u = 0; u < ctx_len; ++u) {
+            // Scores over ctx_len keys.
+            //
+            // BUG FIX (see perplexity note below): this block used to run the
+            // "Madhava principle" — keep only the top-16 keys by raw score and
+            // weight them as score/Σscore, with NO softmax.
+            //
+            // That is not the attention the pretrained weights were trained
+            // with, and two of its properties are fatal on real models:
+            //
+            //   (a) TRUNCATION.  Qwen2.5-0.5B attends over every visible key.
+            //       Keeping 16 silently discards context as soon as the
+            //       sequence is longer than 16 tokens; the model then sees a
+            //       different function than the one whose weights were loaded.
+            //
+            //   (b) NOT A DISTRIBUTION.  Attention scores are signed.  With
+            //       w_i = s_i / Σ s, weights are unbounded, can be negative,
+            //       and wsum can pass through 0 — at which point the result is
+            //       noise amplified by 1e9.  Softmax is exponentiation for a
+            //       reason: it maps ℝ → (0,1) and always sums to 1.
+            //
+            // Measured consequence on Qwen2.5-0.5B (3 texts, real weights):
+            // forward perplexity 2.0e7 vs 37.4 for the reference — and the
+            // logit correlation against transformers was ≈ 0 at every
+            // position, i.e. the forward did not reproduce the model at all.
+            //
+            // The stack's own claim is that selective top-k *can* replace this
+            // "for correctness first".  It cannot — not until the model is
+            // trained with it.  Softmax is restored as the default; the
+            // top-k path stays available behind MADHAVA_TOPK_ATTN for the
+            // experiment that wants to measure the delta honestly.
+            // CAUSAL MASK. Token t may attend to keys 0..(cache_pos + t) only —
+            // never to itself-in-the-future. The loop used to run to `ctx_len`
+            // (= cache_pos + seq_len, the END of the chunk) for every t, so in
+            // a prefill of n > 1 tokens each position saw the positions that
+            // come after it. The model is trained autoregressive; leaking the
+            // future makes the attention a different function.
+            //
+            // Measured (Qwen2.5-0.5B, last-position logits vs transformers):
+            //   n=1 corr 1.000000 | n=2 corr 0.970 | n=3 corr 0.369 | n=4 0.609
+            // — exactly the signature of future leakage, and it vanished once
+            // `lim` was introduced. With the mask, correlation is 1.0 at every
+            // length and the perplexity matches the reference.
+            const int lim = cache_pos + t + 1;
+            std::vector<float> sc(lim);
+            for (int u = 0; u < lim; ++u) {
                 const float* kh = k_cache.data() + ((size_t)u * nkv + kvh) * hd;
                 float s = 0;
                 for (int j = 0; j < hd; ++j) s += qh[j] * kh[j];
-                scores.push_back({s * scale, u});
+                sc[u] = s * scale;
             }
-            // Softmax-free selection: keep the top-k by score, weight = score.
-            // (Madhava principle: selective top-k instead of full softmax.)
-            const int ksel = 16;
-            std::sort(scores.begin(), scores.end(),
-                      [](auto&a, auto&b){return a.first > b.first;});
-            const int keep = std::min(ksel, ctx_len);
-            float wsum = 0;
-            for (int i = 0; i < keep; ++i) wsum += scores[i].first;
-            if (wsum < 1e-9f) wsum = 1.0f;
             float* ot = attn_out.data() + ((size_t)t * nh + hh) * hd;
             for (int j = 0; j < hd; ++j) ot[j] = 0.0f;
-            for (int i = 0; i < keep; ++i) {
-                int u = scores[i].second;
-                float wgt = scores[i].first / wsum;  // normalize (softmax-free)
-                const float* vh = v_cache.data() + ((size_t)u * nkv + kvh) * hd;
-                for (int j = 0; j < hd; ++j) ot[j] += wgt * vh[j];
+
+            // Max for numerical stability (shared by both paths).
+            float m = sc[0];
+            for (int u = 1; u < lim; ++u) if (sc[u] > m) m = sc[u];
+
+            // Select the surviving key set. Full softmax by default; the
+            // controlled-lost-mass rule when MADHAVA_TOPK_ATTN=1.
+            //
+            // The rule: sort by score, keep growing the surviving set until the
+            // mass it accounts for is within ε of the full mass — i.e. until
+            // (1 − Z_kept/Z) < ε. That is an EXACT statement about the mass
+            // actually dropped, so the attention error is bounded by 2ε (see
+            // EpsilonMass above). No bound-of-the-score is involved, because
+            // the true mass is available for free once the scores exist.
+            int keep = lim;
+            std::vector<std::pair<float,int>> ranked;   // (score, key) desc
+            if (MadhavaTopKAttn() && lim > MinKeep()) {
+                ranked.resize(lim);
+                for (int u = 0; u < lim; ++u) ranked[u] = {sc[u], u};
+                std::sort(ranked.begin(), ranked.end(),
+                          [](auto&a, auto&b){return a.first > b.first;});
+                // Z over the whole window, and the target kept-mass.
+                double z_all = 0.0;
+                for (int u = 0; u < lim; ++u) z_all += std::exp((double)sc[u] - m);
+                const double z_target = (1.0 - (double)EpsilonMass()) * z_all;
+                double z_kept = 0.0;
+                int k = 0;
+                for (; k < lim; ++k) {
+                    z_kept += std::exp((double)ranked[k].first - m);
+                    if (k + 1 >= MinKeep() && z_kept >= z_target) break;
+                }
+                keep = std::min(lim, k + 1);
+            }
+
+            if (keep == lim) {
+                // Standard causal softmax attention (the model's own function).
+                float den = 0;
+                for (int u = 0; u < lim; ++u) { sc[u] = std::exp(sc[u] - m); den += sc[u]; }
+                const float inv = den > 0 ? 1.0f / den : 0.0f;
+                for (int u = 0; u < lim; ++u) {
+                    const float wgt = sc[u] * inv;
+                    if (wgt == 0.0f) continue;
+                    const float* vh = v_cache.data() + ((size_t)u * nkv + kvh) * hd;
+                    for (int j = 0; j < hd; ++j) ot[j] += wgt * vh[j];
+                }
+            } else {
+                // Selective path: weights are renormalised over the KEPT set, so
+                // they still form a distribution that sums to 1.
+                double den = 0.0;
+                for (int i = 0; i < keep; ++i)
+                    den += std::exp((double)ranked[i].first - m);
+                const float inv = den > 0 ? (float)(1.0 / den) : 0.0f;
+                for (int i = 0; i < keep; ++i) {
+                    const float wgt = std::exp(ranked[i].first - m) * inv;
+                    const int u = ranked[i].second;
+                    const float* vh = v_cache.data() + ((size_t)u * nkv + kvh) * hd;
+                    for (int j = 0; j < hd; ++j) ot[j] += wgt * vh[j];
+                }
             }
         }
     }

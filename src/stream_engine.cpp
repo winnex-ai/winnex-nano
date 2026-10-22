@@ -13,30 +13,43 @@
 namespace winnex_nano {
 
 namespace {
-// Converts a spectral-encoded chunk (sequence of quaternions) into a flat
-// float vector (the "embedding" the Madhava engine indexes). We use the
-// w/x complex plane magnitude per mode as the coordinate — the deterministic
-// spectral signature of the text.
-std::vector<float> chunk_to_vector(const std::vector<Quat>& states, int embed_dim) {
-    std::vector<float> vec(embed_dim, 0.0f);
-    if (states.empty()) return vec;
-    const size_t n_chars = states.size() / static_cast<size_t>(embed_dim);
-    // Average the per-mode magnitude over the characters of the chunk.
-    for (size_t c = 0; c < n_chars; ++c) {
-        for (int j = 0; j < embed_dim; ++j) {
-            const Quat& q = states[c * static_cast<size_t>(embed_dim) + j];
-            float mag = std::sqrt(q.w * q.w + q.x * q.x);
-            vec[j] += mag;
-        }
-    }
-    const float inv = n_chars > 0 ? 1.0f / n_chars : 1.0f;
-    for (auto& v : vec) v *= inv;
-    // Normalize (Madhava cosine expects normalized embeddings).
-    float norm = 0.0f;
-    for (auto v : vec) norm += v * v;
-    norm = std::sqrt(norm) + 1e-9f;
-    for (auto& v : vec) v /= norm;
-    return vec;
+// Converts a chunk of TEXT into the vector the Madhava engine indexes.
+//
+// BUG FIX (2026-10-21). The previous version took the spectral-encoded
+// quaternions and averaged their per-mode MAGNITUDE sqrt(w² + x²). That
+// tokenizer encodes each byte as a PURE PHASE with amplitude 1.0
+// (w = cos φ, x = sin φ), so w² + x² = 1 identically: the magnitude is 1.0
+// for every character and every mode, the average is 1.0, and after
+// normalisation the result is the CONSTANT vector 1/sqrt(embed_dim) for ANY
+// text. Measured: cos("quantum physics", "banana bread recipe") = 1.000000,
+// and cos("abc","cba") = 1.000000. The StreamEngine was indexing N identical
+// vectors, so retrieval returned an arbitrary member of a tie.
+//
+// The information lives in the PHASE and in the ORDER of the characters.
+// The spectral tokenizer already ships the primitive that preserves both:
+// `encode_hrr_unit` binds each symbol to a per-mode frequency and each
+// position to a position-dependent phase, then sums coherently (T. Plate,
+// Holographic Reduced Representations, IEEE Trans. Neural Networks 1995).
+// Measured on 64-d vectors, distinct texts land at cos 0.005–0.43 instead of
+// 1.000, and "abc" vs "cba" at 0.38 — order is preserved.
+//
+// Using the existing, documented primitive is the fix: the engine's cosine
+// metric requires different texts to be different vectors, and this is
+// deterministic (fixed frequencies, no PRNG), order-sensitive, and normalised.
+std::vector<float> text_to_vector(const std::string& text,
+                                  const SpectralTokenizer& tok, int embed_dim) {
+    std::vector<float> v = tok.encode_hrr_unit(text);
+    if ((int)v.size() == embed_dim) return v;
+    // Different tokenizer dim: resize deterministically (truncate / zero-pad)
+    // and re-normalise so the cosine contract still holds.
+    std::vector<float> out(static_cast<size_t>(std::max(embed_dim, 0)), 0.0f);
+    const int n = std::min((int)v.size(), embed_dim);
+    for (int i = 0; i < n; ++i) out[(size_t)i] = v[(size_t)i];
+    double ss = 0.0;
+    for (float x : out) ss += (double)x * x;
+    const double nrm = std::sqrt(ss);
+    if (nrm > 1e-12) for (float& x : out) x = (float)(x / nrm);
+    return out;
 }
 } // namespace
 
@@ -58,8 +71,7 @@ std::string StreamEngine::stream(
 
     // Seed the corpus with the prompt (its spectral vector).
     {
-        auto states = tokenizer_.encode(prompt);
-        corpus_vectors.push_back(chunk_to_vector(states, opts_.embed_dim));
+        corpus_vectors.push_back(text_to_vector(prompt, tokenizer_, opts_.embed_dim));
         corpus_texts.push_back(prompt);
     }
 
@@ -144,8 +156,7 @@ std::string StreamEngine::stream(
         context += chunk;
 
         // Index the new chunk (incremental working memory).
-        auto states = tokenizer_.encode(chunk);
-        corpus_vectors.push_back(chunk_to_vector(states, opts_.embed_dim));
+        corpus_vectors.push_back(text_to_vector(chunk, tokenizer_, opts_.embed_dim));
         corpus_texts.push_back(chunk);
 
         ++steps;

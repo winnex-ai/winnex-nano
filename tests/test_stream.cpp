@@ -1,8 +1,10 @@
 // test_stream.cpp — validates the Winnex-Nano streaming engine: the chunk
 // generation loop using the Madhava fast build as incremental working memory.
 #include "winnex_nano/stream_engine.hpp"
+#include "winnex_nano/spectral_tokenizer.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -61,6 +63,44 @@ int main() {
     bool ok4 = (emitted[0].find("Primeira") != std::string::npos);
     printf("chunk order correct: %s\n", ok4 ? "OK" : "FAIL");
     if (!ok4) ++failures;
+
+    // 5. ANTI-CHEAT: different texts must produce different vectors.
+    //
+    //    This test did not exist, and its absence is why the engine shipped
+    //    with a `chunk_to_vector` that returned a CONSTANT vector for any
+    //    input: it averaged the magnitude sqrt(w²+x²) of a phase-only
+    //    encoding, which is identically 1.0. Retrieval was therefore a tie
+    //    among N identical vectors, while every test above still passed —
+    //    they check shapes, ordering and timing, never that the representation
+    //    represents anything.
+    //
+    //    Falsifies if: two distinct texts give cosine similarity ~1.
+    {
+        winnex_nano::SpectralTokenizer tok(64);
+        const char* t[] = {"quantum physics", "banana bread recipe",
+                           "O Madhava e deterministico.", "abc", "cba"};
+        std::vector<std::vector<float>> v;
+        for (auto* x : t) v.push_back(tok.encode_hrr_unit(x));
+        double worst = 0.0;
+        for (size_t i = 0; i < v.size(); ++i)
+            for (size_t j = i + 1; j < v.size(); ++j) {
+                double d = 0.0;
+                for (size_t k = 0; k < 64; ++k) d += v[i][k] * v[j][k];
+                if (std::fabs(d) > std::fabs(worst)) worst = d;
+            }
+        bool ok5 = (std::fabs(worst) < 0.90);
+        printf("distinct texts give distinct vectors (max |cos| = %.4f < 0.90): %s\n",
+               std::fabs(worst), ok5 ? "OK" : "FAIL");
+        if (!ok5) ++failures;
+
+        // Order must matter: "abc" and "cba" are not the same chunk.
+        double d_order = 0.0;
+        for (size_t k = 0; k < 64; ++k) d_order += v[3][k] * v[4][k];
+        bool ok6 = (std::fabs(d_order) < 0.90);
+        printf("order matters ('abc' vs 'cba' cos = %.4f < 0.90): %s\n",
+               std::fabs(d_order), ok6 ? "OK" : "FAIL");
+        if (!ok6) ++failures;
+    }
 
     if (failures == 0) {
         printf("\nALL STREAM ENGINE TESTS PASSED\n");

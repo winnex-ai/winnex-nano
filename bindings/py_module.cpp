@@ -22,11 +22,18 @@ namespace py = pybind11;
 using namespace winnex_nano;
 
 namespace {
-// Helper: numpy float32 1D -> std::vector<float>.
+// Helper: numpy float32 array (1D or 2D) -> std::vector<float>.
+//
+// BUG FIX: this used to copy `info.shape[0]` elements, which is the ROW COUNT
+// for a 2D array.  Feeding the documented (seq_len, hidden) input therefore
+// copied `seq_len` floats instead of `seq_len * hidden`, and forward() threw
+// "hidden size mismatch" on every well-formed 2D call — the API in the README
+// did not work.  `info.size` is the total element count for both shapes.
 std::vector<float> as_float_vec(py::array_t<float> a) {
     auto info = a.request();
-    return std::vector<float>((const float*)info.ptr,
-                              (const float*)info.ptr + info.shape[0]);
+    const size_t n = (size_t)info.size;
+    const float* p = (const float*)info.ptr;
+    return std::vector<float>(p, p + n);
 }
 } // namespace
 
