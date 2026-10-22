@@ -52,18 +52,45 @@ engine.stream(
 )
 ```
 
-## SSE server (OpenAI-compatible)
+## Server (OpenAI-compatible, real inference)
 
 ```bash
 pip install "winnex-nano[server]"
-python -m winnex_nano.server_sse 30002
+python -m winnex_nano.server_sse --model /path/to/checkpoint --port 30002
 ```
 
 ```bash
 curl -N http://localhost:30002/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"O Madhava e deterministico"}],"stream":true}'
+  -d '{"messages":[{"role":"user","content":"The capital of France is"}],
+       "max_tokens":32,"stream":true}'
 ```
+
+It runs the native engine end to end: tokenizer → `prefill` → sample → `step` →
+detokenize, on the KV cache, with greedy or temperature/top-k sampling, stop
+sequences, a real chat template when the tokenizer has one, and SSE in OpenAI's
+chunk format. `/health` reports the device and the weight mode that were
+actually selected.
+
+```python
+eng.prefill([...ids])   # -> logits for the last prompt token; fills the KV cache
+eng.step(next_id)       # -> logits for the next token; appends to the cache
+eng.embed_ids([...ids]) # -> [n, hidden] rows, without touching the whole table
+```
+
+`prefill`+`step` is bit-identical to a full `forward` at every position (max
+difference 0.0 over 85 tokens) and matches `transformers` to 1.2e-4.
+
+**Throughput, honestly.** Qwen3-4B on an RTX 5060 Ti in `device` mode: prefill
+40.6 tok/s, decode 2.6 tok/s. Decode is the slow one because attention, RoPE,
+RMSNorm and the residual stream stay on the CPU by design — at `seq_len=1` the
+per-projection device round-trip dominates. Moving the whole layer to OpenCL is
+the next real gain and is not done.
+
+> **Changed in 0.1.28.** Previous versions of this server answered every
+> request with 12-character slices of the prompt. It was commented as a
+> placeholder, but at the HTTP layer it was indistinguishable from a real
+> completion. If you are running an older version, it is not inferring.
 
 ## Honest benchmark (vs BPE)
 
