@@ -757,8 +757,23 @@ void ForwardGpu::matmul(const float* A, int seq,
         impl_->bias_cap = sizeof(float);
     }
 
-    // Upload the activations (they change every call; the weights do not).
-    g_api->clEnqueueWriteBuffer(impl_->q, impl_->ba, CL_TRUE, 0, a_bytes, A, 0, nullptr, nullptr);
+    // ── Non-blocking transfers ─────────────────────────────────────────────
+    //
+    // These were CL_TRUE (blocking) for both the write of A and the read of C.
+    // Each blocking transfer is a full host<->device round-trip plus a driver
+    // sync, and a decode step issues 7 projections x 28 layers = 196 of them.
+    // Measured on Qwen2.5-7B: 0.59 s per decoded token, 1.7 tok/s.
+    //
+    // Neither transfer needs to block. The write is consumed by the kernel
+    // that is queued immediately after it on the SAME in-order queue, so
+    // ordering already guarantees the data is there; the read is followed by
+    // clFinish, which is the only synchronisation the caller actually needs.
+    //
+    // Correctness is unchanged because this is one in-order command queue:
+    // commands complete in submission order. An out-of-order queue would need
+    // explicit events, and there is none here.
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->ba, CL_FALSE, 0, a_bytes, A,
+                                0, nullptr, nullptr);
 
     cl_mem ba = impl_->ba, bb = impl_->bb, bc = impl_->bc;
     const bool is_bf16 = impl_->last_bf16 != 0;
@@ -781,8 +796,8 @@ void ForwardGpu::matmul(const float* A, int seq,
                                         0, nullptr, nullptr);
     if (err != CL_SUCCESS)
         throw std::runtime_error("ForwardGpu: enqueue failed (" + std::to_string(err) + ")");
-    g_api->clEnqueueReadBuffer(impl_->q, bc, CL_TRUE, 0, c_bytes, C, 0, nullptr, nullptr);
-    g_api->clFinish(impl_->q);
+    g_api->clEnqueueReadBuffer(impl_->q, bc, CL_FALSE, 0, c_bytes, C, 0, nullptr, nullptr);
+    g_api->clFinish(impl_->q);   // the one sync this call needs
 
     // SANITY (opt-in): compare the first few GPU outputs against a scalar
     // reference. A wrong GEMM produces garbage that looks like a wrong kernel
