@@ -120,6 +120,9 @@ public:
     // Residency needs the whole model in float32 RAM; when it does not fit,
     // enable_gpu() streams one layer at a time instead of failing.
     std::string weight_mode() const;
+
+    /** Bytes of projection weights resident on the device (0 when unused). */
+    size_t device_weight_bytes() const;
     // Byte cost of holding every layer resident (float32), and the RAM the
     // process can still allocate. Public so a caller can decide before calling
     // enable_gpu().
@@ -136,7 +139,20 @@ private:
 
     // Precomputed model-wide tensors (loaded once in the constructor).
     std::vector<float> final_norm_;      // model.norm.weight [hidden]
-    std::vector<float> embed_tokens_;    // [vocab, hidden] (tied lm_head)
+    // NOT the full [vocab, hidden] table. For the 7B that is 2.18 GB in f32 and
+    // the forward only needs one row at a time, so lm_head is read through
+    // st_->read_rows() instead. Empty here on purpose — see lm_head_row().
+    std::vector<float> embed_tokens_;
+    int embed_tokens_shape_h_ = 0;
+
+    // One row of lm_head (the tied embedding). Returns H floats. Uses the
+    // offset table and converts only the requested row, so decoding a token
+    // touches 14 KB instead of 2.18 GB.
+    const SafeTensor& lm_head_tensor() const;
+    void lm_head_row(int token_id, float* out) const;
+    // logits[v] = dot(hnorm, lm_head[v]) for every v, streamed in blocks so the
+    // table is never resident. `hnorm` is H floats.
+    void lm_head_logits(const float* hnorm, float* logits, int n_positions, int stride) const;
     bool has_separate_lm_head_ = false;  // true when lm_head.weight exists
 
     // Persistent KV cache: per-layer [ctx_len, kv_out].
@@ -156,9 +172,16 @@ private:
     // gives stable addresses, so each weight uploads exactly once.
     std::vector<std::unique_ptr<LayerWeights>> resident_;
     bool layers_resident_ = false;
-    std::string weight_mode_;   // "cpu" | "resident" | "stream"
+    std::string weight_mode_;   // "cpu" | "resident" | "stream" | "device"
+    bool device_weights_ = false;
 
     void load_layer(int layer, LayerWeights& w);
+
+    // Device-resident mode: every projection is uploaded once and the host
+    // copy is released. After warm_device_weights(), run_layer loads only the
+    // norms and biases (a few MB) per layer instead of the 14 GB of matrices.
+    bool warm_device_weights();
+    void load_layer_shallow(int layer, LayerWeights& w);
 
     // Core ops.
     void run_layer(int layer, std::vector<float>& h, int seq_len,

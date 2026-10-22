@@ -124,13 +124,19 @@ ForwardEngine::ForwardEngine(const ModelConfig& cfg, const Safetensors& st)
     // Precompute the model-wide tensors once (the forward path reuses them).
     final_norm_ = st_->to_float(st_->get("model.norm.weight"));
     param_count_ += final_norm_.size();
-    if (st_->has("lm_head.weight")) {
-        embed_tokens_ = st_->to_float(st_->get("lm_head.weight"));  // [V, H]
-        has_separate_lm_head_ = true;
-    } else {
-        embed_tokens_ = st_->to_float(st_->get("model.embed_tokens.weight"));  // [V, H]
+    //
+    // lm_head is NOT materialised. For the 7B it is 152064x3584 = 2.18 GB in
+    // f32, and the forward only ever needs one row of it at a time (the
+    // embedding for a token id) plus the final logits projection — both of
+    // which read_rows() serves without a full copy. Materialising it put the
+    // constructor 2.2 GB over budget and made the 7B fail before any
+    // computation started. has_separate_lm_head_ records that the tensor
+    // exists; embed_tokens_ stays empty and the callers use st_ directly.
+    has_separate_lm_head_ = st_->has("lm_head.weight");
+    if (st_->has("model.embed_tokens.weight")) {
+        embed_tokens_shape_h_ = (int)st_->get("model.embed_tokens.weight").shape[1];
+        param_count_ += (size_t)st_->get("model.embed_tokens.weight").shape[0] * embed_tokens_shape_h_;
     }
-    param_count_ += embed_tokens_.size();
 
     // Parameter count: per-layer weights × layers (counted once, not per token).
     if (cfg_.num_hidden_layers > 0) {
@@ -277,6 +283,35 @@ void ForwardEngine::load_layer(int layer, LayerWeights& w) {
     w.loaded = true;
 }
 
+// Norms and biases only — everything the CPU still needs when the projections
+// are resident on the device. Sizes: O(H) per layer, so 28 layers of the 7B
+// cost a few MB, against 14 GB for the full layer.
+void ForwardEngine::load_layer_shallow(int layer, LayerWeights& w) {
+    std::string L = "model.layers." + std::to_string(layer) + ".";
+    w.hidden = cfg_.hidden_size;
+    w.q_out = cfg_.num_attention_heads * cfg_.head_dim;
+    w.kv_out = cfg_.head_dim * cfg_.num_key_value_heads;
+    w.inter = cfg_.intermediate_size;
+    w.gs = cfg_.group_size;
+
+    w.in_norm = st_->to_float(st_->get(L + "input_layernorm.weight"));
+    w.post_norm = st_->to_float(st_->get(L + "post_attention_layernorm.weight"));
+    auto load_bias = [&](const std::string& base, std::vector<float>& dst) {
+        if (st_->has(base + ".bias")) dst = st_->to_float(st_->get(base + ".bias"));
+        else dst.clear();
+    };
+    auto load_opt = [&](const std::string& base, std::vector<float>& dst) {
+        if (st_->has(base + ".weight")) dst = st_->to_float(st_->get(base + ".weight"));
+        else dst.clear();
+    };
+    load_opt(L + "self_attn.q_norm", w.q_norm);
+    load_opt(L + "self_attn.k_norm", w.k_norm);
+    load_bias(L + "self_attn.q_proj", w.q_b);
+    load_bias(L + "self_attn.k_proj", w.k_b);
+    load_bias(L + "self_attn.v_proj", w.v_b);
+    w.loaded = true;
+}
+
 void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
                               std::vector<float>& k_cache, std::vector<float>& v_cache,
                               int cache_pos) {
@@ -287,7 +322,10 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     LayerWeights w_scratch;
     LayerWeights& w = (gpu_ != nullptr && layer < (int)resident_.size())
                         ? *resident_[layer] : w_scratch;
-    if (&w == &w_scratch) load_layer(layer, w);
+    if (&w == &w_scratch) {
+        if (device_weights_) load_layer_shallow(layer, w);
+        else                 load_layer(layer, w);
+    }
     const int H = w.hidden, nh = cfg_.num_attention_heads, nkv = cfg_.num_key_value_heads;
     const int hd = cfg_.head_dim;
 
@@ -306,12 +344,33 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
         // kv_out = kv_heads*head_dim) so they cannot be a single GEMM without
         // padding buffers to the larger width and slicing after — the padding
         // costs more bandwidth than the three separate launches.
+        //
+        // The `tag` is the safetensors tensor name. The device cache keys on
+        // it, so the weights stay resident on the GPU even when the host copy
+        // is streamed in per layer through a reused scratch buffer — which is
+        // the only way the 7B gets GPU speed at all (13.1 GB bf16 of device
+        // weights, host RAM stays at ~2.3 GB anonymous).
+        if (device_weights_) {
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".q_proj").c_str(),
+                                hn.data(), seq_len, w.q_out, H,
+                                w.q_b.empty() ? nullptr : w.q_b.data(), q.data());
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".k_proj").c_str(),
+                                hn.data(), seq_len, w.kv_out, H,
+                                w.k_b.empty() ? nullptr : w.k_b.data(), k.data());
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".v_proj").c_str(),
+                                hn.data(), seq_len, w.kv_out, H,
+                                w.v_b.empty() ? nullptr : w.v_b.data(), v.data());
+        } else {
         gpu_->matmul(hn.data(), seq_len, w.q_w.data(), w.q_out, H,
-                     w.q_b.empty() ? nullptr : w.q_b.data(), q.data());
+                     w.q_b.empty() ? nullptr : w.q_b.data(), q.data(),
+                     ("L" + std::to_string(layer) + ".q_proj").c_str());
         gpu_->matmul(hn.data(), seq_len, w.k_w.data(), w.kv_out, H,
-                     w.k_b.empty() ? nullptr : w.k_b.data(), k.data());
+                     w.k_b.empty() ? nullptr : w.k_b.data(), k.data(),
+                     ("L" + std::to_string(layer) + ".k_proj").c_str());
         gpu_->matmul(hn.data(), seq_len, w.v_w.data(), w.kv_out, H,
-                     w.v_b.empty() ? nullptr : w.v_b.data(), v.data());
+                     w.v_b.empty() ? nullptr : w.v_b.data(), v.data(),
+                     ("L" + std::to_string(layer) + ".v_proj").c_str());
+        }
     } else {
         for (int t = 0; t < seq_len; ++t) {
             const float* xt = hn.data() + (size_t)t * H;
@@ -546,8 +605,14 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
         // Fourth GPU projection of the layer. o_proj has no bias in any of the
         // supported architectures (Qwen2/2.5/3, Llama), so the fused-bias path
         // is not exercised here.
+        if (device_weights_)
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".o_proj").c_str(),
+                                attn_out.data(), seq_len, H, w.q_out,
+                                nullptr, proj.data());
+        else
         gpu_->matmul(attn_out.data(), seq_len, w.o_w.data(), H, w.q_out,
-                     nullptr, proj.data());
+                     nullptr, proj.data(),
+                     ("L" + std::to_string(layer) + ".o_proj").c_str());
     } else {
         for (int t = 0; t < seq_len; ++t) {
             dense_matmul(proj.data() + (size_t)t * H, attn_out.data() + (size_t)t * w.q_out,
@@ -566,8 +631,17 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
         // same A — the only reason they are not one call is that their output
         // widths are equal but the weights are separate tensors. The SiLU
         // gating stays on the CPU (it is elementwise and cheap).
-        gpu_->matmul(hn2.data(), seq_len, w.g_w.data(), w.inter, H, nullptr, gate.data());
-        gpu_->matmul(hn2.data(), seq_len, w.u_w.data(), w.inter, H, nullptr, up.data());
+        if (device_weights_) {
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".gate_proj").c_str(),
+                                hn2.data(), seq_len, w.inter, H, nullptr, gate.data());
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".up_proj").c_str(),
+                                hn2.data(), seq_len, w.inter, H, nullptr, up.data());
+        } else {
+        gpu_->matmul(hn2.data(), seq_len, w.g_w.data(), w.inter, H, nullptr, gate.data(),
+                     ("L" + std::to_string(layer) + ".gate_proj").c_str());
+        gpu_->matmul(hn2.data(), seq_len, w.u_w.data(), w.inter, H, nullptr, up.data(),
+                     ("L" + std::to_string(layer) + ".up_proj").c_str());
+        }
     } else {
         for (int t = 0; t < seq_len; ++t) {
             const float* xt = hn2.data() + (size_t)t * H;
@@ -581,7 +655,12 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
         gate[i] *= up[i];
     }
     if (gpu_ != nullptr) {
-        gpu_->matmul(gate.data(), seq_len, w.d_w.data(), H, w.inter, nullptr, mlp_out.data());
+        if (device_weights_)
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".down_proj").c_str(),
+                                gate.data(), seq_len, H, w.inter, nullptr, mlp_out.data());
+        else
+        gpu_->matmul(gate.data(), seq_len, w.d_w.data(), H, w.inter, nullptr, mlp_out.data(),
+                     ("L" + std::to_string(layer) + ".down_proj").c_str());
     } else {
         for (int t = 0; t < seq_len; ++t) {
             dense_matmul(mlp_out.data() + (size_t)t * H, gate.data() + (size_t)t * w.inter,
@@ -618,18 +697,68 @@ std::vector<float> ForwardEngine::forward(const std::vector<float>& hidden,
 
     // Logits for the last position (or all) — dense_matmul over the rows.
     const int V = cfg_.vocab_size;
+    std::vector<float> logits((size_t)seq_len * V);
     if (!all_positions) {
-        std::vector<float> logits(V);
+        // Only the last position is asked for, but lm_head_logits fills a
+        // [n_positions, V] block — pass just that row.
         const float* ht = hnorm.data() + (size_t)(seq_len - 1) * H;
-        dense_matmul(logits.data(), ht, embed_tokens_.data(), H, V);
+        lm_head_logits(ht, logits.data(), 1, H);
+        logits.resize((size_t)V);
         return logits;
     }
-    std::vector<float> logits((size_t)seq_len * V);
-    for (int t = 0; t < seq_len; ++t) {
-        const float* ht = hnorm.data() + (size_t)t * H;
-        dense_matmul(logits.data() + (size_t)t * V, ht, embed_tokens_.data(), H, V);
-    }
+    lm_head_logits(hnorm.data(), logits.data(), seq_len, H);
     return logits;
+}
+
+
+// ── lm_head, streamed ──────────────────────────────────────────────────────
+//
+// The embedding table is the single largest tensor in the checkpoint (152064
+// x 3584 = 2.18 GB f32 for the 7B) and the forward needs it in two places:
+// one row per decoded token, and the full logits projection once per forward.
+// Materialising it costs 2.2 GB of anonymous RAM for the whole process life.
+//
+// Both uses go through the offset table instead: a row read touches one row of
+// bytes, and the logits projection converts BLOCK rows at a time. Peak RSS for
+// the table drops from 2.18 GB to one block (512 rows, 7.3 MB).
+static const char* kLmHeadName = "lm_head.weight";
+static const char* kEmbedName  = "model.embed_tokens.weight";
+
+const SafeTensor& ForwardEngine::lm_head_tensor() const {
+    return st_->has(kLmHeadName) ? st_->get(kLmHeadName) : st_->get(kEmbedName);
+}
+
+void ForwardEngine::lm_head_row(int token_id, float* out) const {
+    const SafeTensor& t = lm_head_tensor();
+    const int H = cfg_.hidden_size;
+    std::vector<float> row = st_->read_rows(t, token_id, 1);
+    std::memcpy(out, row.data(), (size_t)H * sizeof(float));
+}
+
+void ForwardEngine::lm_head_logits(const float* hnorm, float* logits,
+                                   int n_positions, int stride) const {
+    const SafeTensor& t = lm_head_tensor();
+    const int H = cfg_.hidden_size;
+    const int V = (int)t.shape[0];
+    // Block size is a throughput/memory trade. 32 rows meant 4752 blocks for
+    // the 7B, each paying an OpenMP region launch and a malloc — measured, it
+    // took the CPU path from 73 s to 125 s. 512 rows is 7.3 MB, still nothing
+    // against the 2.18 GB the table would cost, and leaves the rows wide
+    // enough for the parallel-for to fill the cores.
+    const int BLOCK = 512;
+    for (int v0 = 0; v0 < V; v0 += BLOCK) {
+        const int n = std::min(BLOCK, V - v0);
+        std::vector<float> block = st_->read_rows(t, v0, n);   // no second copy
+        // dense_matmul (AVX2/FMA + OpenMP over rows), not a hand-written loop:
+        // the scalar version measured 30.5 s against 9.1 s for the whole
+        // forward, because the logits projection is 152064x3584 and a scalar
+        // inner loop spends the entire budget waiting on memory.
+        for (int p = 0; p < n_positions; ++p) {
+            dense_matmul(logits + (size_t)p * V + v0,
+                         hnorm + (size_t)p * stride,
+                         block.data(), H, n);
+        }
+    }
 }
 
 ForwardEngine::~ForwardEngine() {
@@ -665,6 +794,24 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
     //
     // The threshold uses 60% of available RAM, leaving room for the activations
     // and the OpenCL driver's own allocations.
+    // ── DEVICE MODE (2026-10-23) ──────────────────────────────────────────
+    //
+    // The measurement that forced this: on Qwen2.5-7B the GPU path in stream
+    // mode ran at 90.8 s against the CPU's 67.0 s. Re-uploading 14.2 GB of
+    // weights per forward costs ~1 s more than the CPU spends computing the
+    // whole thing — so "GPU + stream" was strictly a loss.
+    //
+    // But the upload was only happening because the device cache is keyed by
+    // host pointer and streaming reuses one scratch buffer. Key the cache by
+    // TENSOR NAME instead (ForwardEngine passes `L3.gate_proj` etc.) and the
+    // device keeps every matrix it has ever seen, for free, across forwards.
+    //
+    // Once the weights live on the device they are never read from the host
+    // again. So in device mode run_layer loads nothing per layer: no 14.2 GB
+    // memcpy per forward, no f32 host copy of any projection, and host RAM
+    // drops to norms + biases + activations (~200 MB for the 7B). The weights
+    // are bf16 on the device (13.1 GB) because the f32 form (26.1 GB) does not
+    // fit the 16 GB card — see ForwardGpu::should_use_bf16.
     const double bytes_resident = estimate_resident_bytes();
     const double ram_avail = available_ram_bytes();
     const double budget = ram_avail * 0.60;
@@ -684,6 +831,98 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
         // because resident_ stays empty.
         weight_mode_ = "stream";
     }
+    // Warm the device copy once. Done here rather than lazily inside the first
+    // forward so the upload cost does not land inside a timed region, and so a
+    // device that cannot hold the weights fails at enable_gpu() rather than
+    // halfway through a benchmark.
+    if (gpu_ != nullptr) {
+        // Declare the total BEFORE the first upload so bf16-vs-f32 is decided
+        // once for the whole model, not per matrix.
+        gpu_->declare_weight_bytes((size_t)estimate_resident_bytes());
+        const bool fit = gpu_->weights_fit((size_t)estimate_resident_bytes());
+        const bool warmed = fit && warm_device_weights();
+        if (const char* dbg = std::getenv("WINNEX_GPU_DEBUG_MODE"))
+            std::fprintf(stderr, "[gpu] fit=%d warmed=%d total=%.2fGB dev_total=%.2fGB "
+                                 "dev_free=%.2fGB devbytes=%.2fGB\n",
+                         (int)fit, (int)warmed, estimate_resident_bytes() / 1073741824.0,
+                         gpu_->device_memory_total() / 1073741824.0,
+                         gpu_->device_memory_free() / 1073741824.0,
+                         gpu_->device_weight_bytes() / 1073741824.0);
+        if (warmed) {
+            device_weights_ = true;
+            weight_mode_ = "device";
+        } else {
+            // The model is too big for the device. Warmup may already have put
+            // some layers there; drop them so every weight lives in exactly one
+            // place and run_layer can still find a host copy of each.
+            gpu_->release_weights();
+            weight_mode_ = "stream";
+        }
+    }
+}
+
+// Upload every projection to the device once and drop the host copy.
+//
+// After this returns, run_host_weights_ is false and run_layer reads only the
+// norms and biases from the host — it never touches the 14 GB of projections
+// again. On a machine where the device cannot hold them, this throws and the
+// engine falls back to resident/stream automatically.
+bool ForwardEngine::warm_device_weights() {
+    const int nl = cfg_.num_hidden_layers;
+    const int H = cfg_.hidden_size;
+    const int inter = cfg_.intermediate_size;
+    std::vector<float> dummy((size_t)H, 0.0f);
+    std::vector<float> out;
+
+    // One projection at a time. Holding a whole LayerWeights costs 3.4 GB for a
+    // 7B layer (gate+up+down are 1.1 GB each) on top of the 12 GB already on
+    // the device, and the upload then fails with CL_MEM_OBJECT_ALLOCATION_
+    // FAILURE (-4) even though the model itself fits. Each vector is released
+    // as soon as its cl_mem exists, so the host peak is one matrix (~1.1 GB).
+    try {
+    for (int l = 0; l < nl; ++l) {
+        LayerWeights w;
+        const std::string L = "model.layers." + std::to_string(l) + ".";
+        w.hidden = H;
+        w.q_out = cfg_.num_attention_heads * cfg_.head_dim;
+        w.kv_out = cfg_.head_dim * cfg_.num_key_value_heads;
+        w.inter = inter;
+        w.in_norm = st_->to_float(st_->get(L + "input_layernorm.weight"));
+        w.post_norm = st_->to_float(st_->get(L + "post_attention_layernorm.weight"));
+        auto bias_of = [&](const std::string& b) {
+            return st_->has(b + ".bias") ? st_->to_float(st_->get(b + ".bias"))
+                                          : std::vector<float>();
+        };
+        w.q_b = bias_of(L + "self_attn.q_proj");
+        w.k_b = bias_of(L + "self_attn.k_proj");
+        w.v_b = bias_of(L + "self_attn.v_proj");
+
+        // The tag MUST match the one run_layer() asks for, or the device keeps
+        // two copies of every matrix and device mode never finds its weights.
+        const std::string T = "L" + std::to_string(l) + ".";
+        auto push = [&](const char* tag, const std::string& base,
+                        int out_dim, int in_dim, const std::vector<float>& bias) {
+            std::vector<float> Wt = st_->to_float(st_->get(base + ".weight"));
+            out.assign((size_t)out_dim, 0.0f);
+            gpu_->matmul(dummy.data(), 1, Wt.data(), out_dim, in_dim,
+                         bias.empty() ? nullptr : bias.data(), out.data(),
+                         (T + tag).c_str());
+            std::vector<float>().swap(Wt);      // release before the next one
+        };
+        push("q_proj",    L + "self_attn.q_proj", w.q_out, H, w.q_b);
+        push("k_proj",    L + "self_attn.k_proj", w.kv_out, H, w.k_b);
+        push("v_proj",    L + "self_attn.v_proj", w.kv_out, H, w.v_b);
+        push("o_proj",    L + "self_attn.o_proj", H, w.q_out, {});
+        push("gate_proj", L + "mlp.gate_proj", inter, H, {});
+        push("up_proj",   L + "mlp.up_proj", inter, H, {});
+        push("down_proj", L + "mlp.down_proj", H, inter, {});
+    }
+    } catch (const std::exception&) {
+        // Host or device ran out. Partial state is unusable (some layers
+        // tagged, some not) so the caller falls back to streaming.
+        return false;
+    }
+    return true;
 }
 
 // Byte cost of holding every layer resident in float32.
@@ -719,6 +958,10 @@ double ForwardEngine::available_ram_bytes() {
         std::getline(f, rest);
     }
     return -1.0;   // unknown: caller treats as "do not go resident"
+}
+
+size_t ForwardEngine::device_weight_bytes() const {
+    return gpu_ ? gpu_->device_weight_bytes() : 0;
 }
 
 std::string ForwardEngine::weight_mode() const {
@@ -762,7 +1005,7 @@ std::vector<float> ForwardEngine::forward_next(const std::vector<float>& hidden)
     std::vector<float> hnorm(H);
     rms_norm(hnorm.data(), h.data(), final_norm_.data(), 1, H, cfg_.rms_norm_eps);
     std::vector<float> logits(cfg_.vocab_size);
-    dense_matmul(logits.data(), hnorm.data(), embed_tokens_.data(), H, cfg_.vocab_size);
+    lm_head_logits(hnorm.data(), logits.data(), 1, H);
     return logits;
 }
 
@@ -785,8 +1028,8 @@ std::vector<int> ForwardEngine::generate(const std::vector<float>& h_prompt,
         out.push_back(tid);
         if (eos_id >= 0 && tid == eos_id) break;
         // Next hidden state = embed_tokens[tid] (tied lm_head).
-        const float* row = embed_tokens_.data() + (size_t)tid * cfg_.hidden_size;
-        h.assign(row, row + cfg_.hidden_size);
+        h.assign(cfg_.hidden_size, 0.0f);
+        lm_head_row(tid, h.data());
     }
     return out;
 }

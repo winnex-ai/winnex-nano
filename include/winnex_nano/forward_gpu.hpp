@@ -49,10 +49,56 @@ public:
     /**
      * C[seq, out_dim] = A[seq, in_dim] · W[out_dim, in_dim]ᵀ + bias[out_dim]
      * W is row-major [out, in] — the safetensors layout. `bias` may be null.
+     *
+     * `tag` names the weight for the device cache. Weights are immutable, so a
+     * stable name (e.g. "model.layers.3.mlp.gate_proj.weight") lets the device
+     * keep them across forwards even when the host copy is reloaded per layer
+     * and its address is reused — which is exactly what streaming does.
      */
     void matmul(const float* A, int seq,
                 const float* W, int out_dim, int in_dim,
-                const float* bias, float* C);
+                const float* bias, float* C,
+                const char* tag = nullptr);
+
+    /**
+     * Device-only projection. `tag` must already be resident (uploaded by a
+     * previous tagged matmul); the host pointer is never read. This is the
+     * path used once ForwardEngine has moved every weight to the device — the
+     * host no longer holds a copy of any projection matrix.
+     */
+    void matmul_device(const char* tag, const float* A, int seq,
+                       int out_dim, int in_dim, const float* bias, float* C);
+
+    /**
+     * Tell the device how many bytes of f32 weights the engine intends to
+     * upload IN TOTAL. The bf16-vs-f32 decision is made once from this number;
+     * deciding per matrix mixes formats on the device and corrupts every
+     * launch after the first switch.
+     */
+    void declare_weight_bytes(size_t total_f32_bytes);
+
+    /** True when `tag` is resident on the device. */
+    bool has_weight(const char* tag) const;
+
+    /** Device memory total and free, in bytes (0 when the driver will not say). */
+    size_t device_memory_total() const;
+    size_t device_memory_free() const;
+
+    /**
+     * Decide, before a single byte moves, whether the whole model fits.
+     * Any byte the device will hand out (95% of what it reports free) is
+     * available; a model that does not fit must NOT be uploaded, because a
+     * half-uploaded model cannot be run and the driver may not fail cleanly.
+     */
+    bool weights_fit(size_t total_f32_bytes) const;
+
+    /** Drop every weight from the device and return to the streaming path. */
+    void release_weights();
+
+    /** Byte size of the weights currently resident on the device. */
+    size_t device_weight_bytes() const;
+    /** True when the device copy is bf16 (weights did not fit f32). */
+    bool weights_are_bf16() const;
 
 private:
     struct Impl;

@@ -85,6 +85,83 @@ The spectral tokenizer is 100% deterministic with no vocabulary dependency, but
 50–70× slower and ~1000× less compact than BPE. It is an autonomous encoding for
 the native multimodel engine, NOT a drop-in BPE replacement for a BPE-trained model.
 
+## Native forward pass — memory and speed
+
+`ForwardEngine` runs a Qwen2/Qwen2.5/Qwen3/Llama checkpoint without torch, without
+transformers and without CUDA. Weights come straight out of the `.safetensors`
+file; the heavy matrix work goes to OpenCL.
+
+```python
+import struct, numpy as np, winnex_nano as wn
+
+# Map the payload instead of copying it. The 7B payload is 14.2 GB and the
+# constructor copies it; view() borrows it and lets the kernel page it in.
+with open(P, "rb") as f:
+    hlen = struct.unpack("<Q", f.read(8))[0]
+    header = f.read(hlen).decode()
+st = wn.Safetensors.view(
+    np.memmap(P, dtype=np.uint8, mode="r", offset=8 + hlen), header)
+
+eng = wn.ForwardEngine(wn.load_config(cfg_path), st)
+eng.enable_gpu()            # decides the weight strategy, see below
+print(eng.weight_mode)      # "device" | "resident" | "stream" | "cpu"
+```
+
+`enable_gpu()` picks one of three strategies, in this order:
+
+| Mode | What lives where | When |
+|------|------------------|------|
+| `device` | every projection on the GPU (bf16 when f32 does not fit); host keeps only norms and biases | the model fits in VRAM |
+| `resident` | every projection in host RAM, stable pointers | fits in 60% of available RAM, no usable GPU |
+| `stream` | one layer at a time through a scratch buffer | otherwise |
+
+Measured on an RTX 5060 Ti (16 GB) and a 31 GB host, Qwen2.5-7B, 131 tokens:
+
+| Path | PPL | Time | RSS | Anonymous heap |
+|------|-----|------|-----|----------------|
+| CPU | 15.55172 | 69.8 s | 14.2 GB | 0.69 GB |
+| GPU `device` | 15.55171 | 7.5 s | 14.4 GB | 0.74 GB |
+
+The perplexity difference is 7e-6 relative — the checkpoint is already bf16, so
+the GPU path's bf16 weights are the same numbers the CPU reads after widening
+them to f32. Nothing is lost that was ever in the file.
+
+RSS stays high in both rows because the payload is *mapped*: those pages are the
+file, evictable under pressure, not heap. The number that decides whether a model
+fits a machine is the anonymous column.
+
+### Why it is built this way
+
+- **`view` instead of a copy.** The constructor reads the whole payload into a
+  `std::vector`. For the 7B that is 14.2 GB before a single weight is used, and
+  it is what made the Kaggle run die with "Kernel died". `view()` follows the
+  MadhavaL2 contract: the caller owns the pointer, the engine never copies.
+- **Weights keyed by tensor name, not by host pointer.** In `stream` mode
+  `run_layer` builds a fresh `LayerWeights` per call, so every matrix gets a new
+  address and the device cache never hits — the GPU then re-uploads 14.2 GB per
+  forward and measures *slower* than the CPU (90.8 s against 67.0 s). Naming the
+  weights (`L3.gate_proj`) lets the device keep them for the life of the engine
+  regardless of what the host allocator does.
+- **bf16 weights when f32 does not fit.** The 7B in f32 is 26.1 GB against a
+  16 GB card. The dtype is decided once for the whole model from the declared
+  total; deciding per matrix mixes formats on the device and corrupts every
+  launch after the first switch.
+- **Tiled GEMM.** The original kernel was one work-item per output element with
+  no blocking — arithmetic intensity 1 FLOP/byte against a machine balance of
+  ~26, i.e. the kernel waited on its own weight reads. 16x16 local-memory tiles
+  cut global traffic per MAC by ~8x.
+- **lm_head streamed.** The embedding table is the largest single tensor
+  (152064x3584). Both of its uses — one row per decoded token, and the logits
+  projection — go through the offset table in 512-row blocks, so it costs 7.3 MB
+  instead of 2.18 GB.
+
+### Splitting a model into shards
+
+`ForwardEngine` takes one `Safetensors`. Checkpoints that arrive as
+`model-00001-of-0000N.safetensors` must be merged into a single file first —
+concatenating the payloads byte-for-byte, without decoding, preserves bf16 and
+avoids the 30 GB a float32 merge would need.
+
 ## License
 
 Business Source License 1.1 (BSL 1.1) — `pay@winnex.ai`.

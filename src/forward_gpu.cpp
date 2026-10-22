@@ -31,6 +31,13 @@
 #include <utility>
 #include <vector>
 
+// CL_DEVICE_GLOBAL_MEM_FREE_MEMORY is an AMD extension (cl_amd_device_attribute_query)
+// that NVIDIA also exports; it is not in the Khronos cl.h. Define it locally and
+// treat a query failure as "unknown", which makes the caller choose bf16.
+#ifndef CL_DEVICE_GLOBAL_MEM_FREE_MEMORY
+#define CL_DEVICE_GLOBAL_MEM_FREE_MEMORY 0x4103
+#endif
+
 // ── Portable dynamic loading ───────────────────────────────────────────────
 // dlopen/dlsym/dlclose are POSIX; Windows uses LoadLibrary/GetProcAddress.
 // Same shim winnex-madhava and winnex-xfactor-c already use.
@@ -78,6 +85,7 @@ struct FgApi {
                                   void*, cl_uint, const cl_event*, cl_event*);
     cl_int (*clEnqueueWriteBuffer)(cl_command_queue, cl_mem, cl_bool, size_t, size_t,
                                    const void*, cl_uint, const cl_event*, cl_event*);
+    cl_int (*clGetMemObjectInfo)(cl_mem, cl_mem_info, size_t, void*, size_t*);
     cl_int (*clFinish)(cl_command_queue);
     cl_int (*clReleaseMemObject)(cl_mem);
     cl_int (*clReleaseKernel)(cl_kernel);
@@ -162,6 +170,7 @@ void load_opencl(const std::string& explicit_lib) {
     FG_LOAD(clCreateKernel);            FG_LOAD(clCreateBuffer);
     FG_LOAD(clSetKernelArg);            FG_LOAD(clEnqueueNDRangeKernel);
     FG_LOAD(clEnqueueReadBuffer);       FG_LOAD(clEnqueueWriteBuffer);
+    FG_LOAD(clGetMemObjectInfo);
     FG_LOAD(clFinish);
     FG_LOAD(clReleaseMemObject);        FG_LOAD(clReleaseKernel);
     FG_LOAD(clReleaseProgram);          FG_LOAD(clReleaseCommandQueue);
@@ -187,42 +196,104 @@ void load_opencl(const std::string& explicit_lib) {
 // The bias is fused into the accumulation: the CPU path does a matmul and then
 // a separate add loop per projection, one extra pass over the output per call.
 //
-// Work-item = one output element. The inner loop is unrolled by 8 so the loads
-// from A and W pipeline. A tiled shared-memory GEMM would cut global traffic
-// further; this version is deliberately simple so the first measurement
-// isolates "is the GPU faster at all" from "is the tiling optimal".
+//
+// TILED, 2026-10-23. The previous kernel was one work-item per output element
+// with no blocking: every element of C[seq, out] re-read the whole of A[t]
+// from global memory and its own row of W exactly once — arithmetic intensity
+// 1 FLOP/byte against a machine balance of ~26. That is why the projections
+// only reached 2.47x and why the GPU lost to the CPU once a transfer was in
+// the loop: the kernel spent its time waiting on its own weight reads.
+//
+// This version stages a 16x16 tile of A and a 16x16 tile of W in local memory
+// per k-step, so 256 outputs come from 512 global loads instead of 256 rows.
+// ~8x less global traffic per MAC.
+//
+// bf16 WEIGHTS (2026-10-23). The 7B in f32 is 26.1 GB — it does not fit the
+// 16 GB card, which was the entire reason `enable_gpu` had to fall back to
+// streaming and lose to the CPU. The checkpoint is already bf16 and each
+// projection is a 3584-term dot product, so bf16 operands give ~2-3 decimal
+// digits, which is what the checkpoint carries anyway. bf16 halves the device
+// footprint to 13.1 GB and fits. The CPU keeps f32 for RMSNorm, RoPE,
+// attention and the residual stream, so the error stays confined to the
+// projections instead of compounding over 28 layers.
+#define TSB 16
+#define TSK 16
 const char* kGemmSrc = R"(
-__kernel void gemm_bias(
+#define TSB 16
+#define TSK 16
+
+__kernel __attribute__((reqd_work_group_size(TSB, TSB, 1)))
+void gemm_bias(
     __global const float* A,      // [seq, in]
     __global const float* W,      // [out, in]
     __global const float* bias,   // [out] (has_bias=0 -> ignored)
     __global float* C,            // [seq, out]
     int seq, int in_dim, int out_dim, int has_bias)
 {
-    int gid = (int)get_global_id(0);
-    if (gid >= seq * out_dim) return;
-    int t = gid / out_dim;
-    int o = gid - t * out_dim;
+    __local float Aw[TSB][TSK];
+    __local float Ww[TSB][TSK];
 
-    const __global float* wrow = W + (size_t)o * in_dim;
-    const __global float* arow = A + (size_t)t * in_dim;
+    const int lr = (int)get_local_id(0);      // output row within the tile
+    const int lc = (int)get_local_id(1);      // sequence row within the tile
+    const int r0 = (int)get_global_id(0) - lr;
+    const int t0 = (int)get_global_id(1) - lc;
+    const int wr = r0 + lr, ar = t0 + lr;
 
     float acc = 0.0f;
-    int i = 0;
-    for (; i + 8 <= in_dim; i += 8) {
-        acc += arow[i+0] * wrow[i+0];
-        acc += arow[i+1] * wrow[i+1];
-        acc += arow[i+2] * wrow[i+2];
-        acc += arow[i+3] * wrow[i+3];
-        acc += arow[i+4] * wrow[i+4];
-        acc += arow[i+5] * wrow[i+5];
-        acc += arow[i+6] * wrow[i+6];
-        acc += arow[i+7] * wrow[i+7];
+    const int nk = (in_dim + TSK - 1) / TSK;
+    for (int kb = 0; kb < nk; ++kb) {
+        const int k = kb * TSK + lc;
+        Ww[lr][lc] = (wr < out_dim && k < in_dim) ? W[(size_t)wr * in_dim + k] : 0.0f;
+        Aw[lr][lc] = (ar < seq     && k < in_dim) ? A[(size_t)ar * in_dim + k] : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int j = 0; j < TSK; ++j) acc += Aw[lc][j] * Ww[lr][j];
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    for (; i < in_dim; ++i) acc += arow[i] * wrow[i];
 
-    if (has_bias) acc += bias[o];
-    C[(size_t)t * out_dim + o] = acc;
+    const int t = t0 + lc;
+    if (wr < out_dim && t < seq) {
+        if (has_bias) acc += bias[wr];
+        C[(size_t)t * out_dim + wr] = acc;
+    }
+}
+
+__kernel __attribute__((reqd_work_group_size(TSB, TSB, 1)))
+void gemm_bias_bf16(
+    __global const float* A,
+    __global const ushort* W,     // [out, in] bf16
+    __global const float* bias,
+    __global float* C,
+    int seq, int in_dim, int out_dim, int has_bias)
+{
+    __local float Aw[TSB][TSK];
+    __local float Ww[TSB][TSK];
+
+    const int lr = (int)get_local_id(0);
+    const int lc = (int)get_local_id(1);
+    const int r0 = (int)get_global_id(0) - lr;
+    const int t0 = (int)get_global_id(1) - lc;
+    const int wr = r0 + lr, ar = t0 + lr;
+
+    float acc = 0.0f;
+    const int nk = (in_dim + TSK - 1) / TSK;
+    for (int kb = 0; kb < nk; ++kb) {
+        const int k = kb * TSK + lc;
+        // bf16 -> f32 is a 16-bit shift into the high half; no rounding.
+        Ww[lr][lc] = (wr < out_dim && k < in_dim)
+                     ? as_float((uint)W[(size_t)wr * in_dim + k] << 16) : 0.0f;
+        Aw[lr][lc] = (ar < seq && k < in_dim) ? A[(size_t)ar * in_dim + k] : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int j = 0; j < TSK; ++j) acc += Aw[lc][j] * Ww[lr][j];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    const int t = t0 + lc;
+    if (wr < out_dim && t < seq) {
+        if (has_bias) acc += bias[wr];
+        C[(size_t)t * out_dim + wr] = acc;
+    }
 }
 )";
 
@@ -235,6 +306,9 @@ struct ForwardGpu::Impl {
     cl_command_queue q = nullptr;
     cl_program prog = nullptr;
     cl_kernel k_gemm = nullptr;
+    cl_kernel k_gemm_bf16 = nullptr;
+    cl_device_id dev = nullptr;
+    size_t dev_total = 0, dev_free = 0;
     char dev_name[256] = {0};
 
     // ── Resident weight cache ──────────────────────────────────────────────
@@ -269,7 +343,7 @@ struct ForwardGpu::Impl {
     // The fingerprint is a cheap FNV-1a over a strided sample of the matrix
     // (up to 4096 floats). It is not cryptographic — it only has to distinguish
     // "this is a different layer's weight" from "same weight, same address".
-    struct Entry { cl_mem mem; size_t n; uint64_t fp; };
+    struct Entry { cl_mem mem; size_t n; uint64_t fp; int bf16; };
     std::unordered_map<const void*, Entry> wcache;
 
     static uint64_t fingerprint(const float* W, size_t n) {
@@ -285,26 +359,148 @@ struct ForwardGpu::Impl {
         return h;
     }
 
-    cl_mem weight_buffer(const float* W, size_t n_floats) {
-        const uint64_t fp = fingerprint(W, n_floats);
-        auto it = wcache.find((const void*)W);
-        if (it != wcache.end() && it->second.n == n_floats && it->second.fp == fp)
-            return it->second.mem;
+    // ── Device dtype ──────────────────────────────────────────────────────
+    //
+    // Decided once, for the WHOLE MODEL, from the size the caller declares.
+    // Deciding per-matrix is what broke the first attempt: v_proj (512x3584)
+    // fits f32 easily, so it went up as f32 while gate_proj (18944x3584) went
+    // up as bf16. The kernels are selected from a single flag, so the second
+    // upload silently switched the flag for weights already resident in the
+    // other format — every subsequent launch read bf16 bytes through the f32
+    // kernel. clSetKernelArg accepts that; the enqueue then fails with
+    // CL_INVALID_KERNEL_ARGS (-52) on whatever projected next.
+    //
+    // total_weight_bytes is the sum of every projection matrix the engine
+    // intends to upload; 0 means "unknown", which keeps f32.
+    int bf16_cache = -1;   // -1 = undecided
+    size_t device_free_bytes = 0;
+    size_t declared_total_bytes = 0;
+
+    void declare_total_weight_bytes(size_t n) { declared_total_bytes = n; }
+
+    bool should_use_bf16() {
+        if (bf16_cache >= 0) return bf16_cache != 0;
+        if (const char* env = std::getenv("WINNEX_GPU_DTYPE")) {
+            if (std::string(env) == "bf16") { bf16_cache = 1; return true; }
+            if (std::string(env) == "f32")  { bf16_cache = 0; return false; }
+        }
+        cl_ulong total = 0, freeb = 0;
+        size_t got = 0;
+        if (g_api->clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE,
+                                   sizeof(total), &total, &got) == CL_SUCCESS)
+            device_free_bytes = (size_t)total;
+        if (g_api->clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_FREE_MEMORY,
+                                   sizeof(freeb), &freeb, &got) == CL_SUCCESS &&
+            (size_t)freeb > 0)
+            device_free_bytes = (size_t)freeb;
+
+        if (declared_total_bytes == 0 || device_free_bytes == 0) {
+            bf16_cache = 0;
+            return false;
+        }
+        // 90% of what the device reports, leaving room for activations, the
+        // KV cache, the driver's own allocations and the output buffers.
+        const size_t budget = (size_t)((double)device_free_bytes * 0.90);
+        bf16_cache = (declared_total_bytes > budget) ? 1 : 0;
+        return bf16_cache != 0;
+    }
+
+    // Tag -> device buffer. A named weight is uploaded once and stays on the
+    // device for the life of the engine, even when the host side streams layers
+    // in and out of a reused scratch buffer.
+    std::unordered_map<std::string, cl_mem> tagged;
+
+    // The f32 weight cache is only a fallback for callers that pass raw
+    // pointers without a tag. A TAGGED upload must never be evicted: the
+    // allocator hands the same address to the next streamed layer, and the
+    // eviction left `tagged` holding a released cl_mem — the enqueue then
+    // failed with -52 on a buffer that no longer existed.
+    int last_bf16 = 0;
+
+    // clSetKernelArg returns an error code on failure; the old code discarded
+    // it, so a bad argument surfaced only as CL_INVALID_KERNEL_ARGS (-52) at
+    // enqueue time with no indication of which of the eight args was wrong.
+    static void set_args_checked(cl_kernel k, cl_mem a, cl_mem w, cl_mem b, cl_mem c,
+                                 int seq, int in_dim, int out_dim, int has_bias) {
+        struct { cl_uint i; size_t sz; const void* p; } args[8] = {
+            {0, sizeof(cl_mem), &a}, {1, sizeof(cl_mem), &w},
+            {2, sizeof(cl_mem), &b}, {3, sizeof(cl_mem), &c},
+            {4, sizeof(int), &seq},  {5, sizeof(int), &in_dim},
+            {6, sizeof(int), &out_dim}, {7, sizeof(int), &has_bias},
+        };
+        for (auto& e : args) {
+            cl_int e2 = g_api->clSetKernelArg(k, e.i, e.sz, e.p);
+            if (e2 != CL_SUCCESS)
+                throw std::runtime_error("ForwardGpu: clSetKernelArg(" +
+                                         std::to_string(e.i) + ") failed (" +
+                                         std::to_string(e2) + ")");
+        }
+    }
+
+    cl_mem weight_buffer(const float* W, size_t n_floats, const char* tag,
+                         bool require_existing = false) {
+        if (tag != nullptr) {
+            auto t = tagged.find(tag);
+            if (t != tagged.end()) return t->second;
+        }
+        if (require_existing || W == nullptr)
+            throw std::runtime_error(std::string("ForwardGpu: weight not resident: ") +
+                                     (tag ? tag : "(untagged)"));
+
+        // Untagged callers may hit the pointer cache; tagged ones always
+        // upload their own buffer and are never evicted.
+        auto it = wcache.end();
+        if (tag == nullptr) {
+            const uint64_t fp = fingerprint(W, n_floats);
+            it = wcache.find((const void*)W);
+            if (it != wcache.end() && it->second.n == n_floats && it->second.fp == fp)
+                return it->second.mem;
+        }
+
+        const bool as_bf16 = should_use_bf16();
+        last_bf16 = as_bf16 ? 1 : 0;
         cl_int err = CL_SUCCESS;
-        cl_mem b = g_api->clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                         n_floats * sizeof(float), (void*)W, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("ForwardGpu: weight buffer failed");
-        if (it != wcache.end()) g_api->clReleaseMemObject(it->second.mem);
-        wcache[(const void*)W] = {b, n_floats, fp};
+        cl_mem b = nullptr;
+
+        if (as_bf16) {
+            // Convert on the host. Halves PCIe traffic as well as device
+            // footprint — the same truncation the checkpoint already carries.
+            std::vector<unsigned short> half(n_floats);
+            for (size_t i = 0; i < n_floats; ++i) {
+                uint32_t bits;
+                std::memcpy(&bits, W + i, 4);
+                // Round-to-nearest-even on the dropped 16 bits, so a bf16-exact
+                // value round-trips unchanged.
+                bits += 0x7fffu + ((bits >> 16) & 1u);
+                half[i] = (unsigned short)(bits >> 16);
+            }
+            b = g_api->clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      n_floats * sizeof(unsigned short), half.data(), &err);
+        } else {
+            b = g_api->clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      n_floats * sizeof(float), (void*)W, &err);
+        }
+        if (err != CL_SUCCESS)
+            throw std::runtime_error("ForwardGpu: weight buffer failed (" +
+                                     std::to_string(err) + ") for " +
+                                     (tag ? tag : "untagged") + " of " +
+                                     std::to_string(n_floats) + " floats");
+        if (tag != nullptr) tagged[tag] = b;
+        else {
+            if (it != wcache.end()) g_api->clReleaseMemObject(it->second.mem);
+            wcache[(const void*)W] = {b, n_floats, 0, last_bf16};
+        }
         return b;
     }
 
     ~Impl() {
+        // tagged holds the same cl_mem values as wcache; release each once.
         for (auto& kv : wcache) g_api->clReleaseMemObject(kv.second.mem);
         if (ba) g_api->clReleaseMemObject(ba);
         if (bc) g_api->clReleaseMemObject(bc);
         if (bb) g_api->clReleaseMemObject(bb);
         if (k_gemm) g_api->clReleaseKernel(k_gemm);
+        if (k_gemm_bf16) g_api->clReleaseKernel(k_gemm_bf16);
         if (prog) g_api->clReleaseProgram(prog);
         if (q) g_api->clReleaseCommandQueue(q);
         if (ctx) g_api->clReleaseContext(ctx);
@@ -358,8 +554,21 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
                                              ln, log.data(), nullptr);
         throw std::runtime_error(std::string("ForwardGpu: clBuildProgram failed:\n") + log.data());
     }
+    impl_->dev = dev;
+    {
+        cl_ulong total = 0, freeb = 0;
+        size_t got = 0;
+        if (g_api->clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE,
+                                   sizeof(total), &total, &got) == CL_SUCCESS)
+            impl_->dev_total = (size_t)total;
+        if (g_api->clGetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_FREE_MEMORY,
+                                   sizeof(freeb), &freeb, &got) == CL_SUCCESS)
+            impl_->dev_free = (size_t)freeb;
+    }
     impl_->k_gemm = g_api->clCreateKernel(impl_->prog, "gemm_bias", &err);
-    if (err != CL_SUCCESS || !impl_->k_gemm)
+    if (err == CL_SUCCESS)
+        impl_->k_gemm_bf16 = g_api->clCreateKernel(impl_->prog, "gemm_bias_bf16", &err);
+    if (err != CL_SUCCESS || !impl_->k_gemm || !impl_->k_gemm_bf16)
         throw std::runtime_error("ForwardGpu: clCreateKernel failed");
 
     g_reason = std::string("ok: ") + impl_->dev_name;
@@ -371,9 +580,129 @@ bool ForwardGpu::ready() const { return impl_ != nullptr && impl_->k_gemm != nul
 std::string ForwardGpu::device_name() const { return impl_ ? impl_->dev_name : ""; }
 std::string ForwardGpu::reason() { return g_reason; }
 
+void ForwardGpu::declare_weight_bytes(size_t total_f32_bytes) {
+    impl_->declare_total_weight_bytes(total_f32_bytes);
+}
+
+bool ForwardGpu::has_weight(const char* tag) const {
+    return impl_ && tag != nullptr && impl_->tagged.count(tag) > 0;
+}
+
+void ForwardGpu::matmul_device(const char* tag, const float* A, int seq,
+                               int out_dim, int in_dim, const float* bias, float* C) {
+    // Same body as matmul(), but the weight buffer is looked up by name and is
+    // REQUIRED to exist. No host pointer is dereferenced: in device mode the
+    // host has already dropped every projection matrix.
+    const size_t a_bytes = (size_t)seq * in_dim * sizeof(float);
+    const size_t c_bytes = (size_t)seq * out_dim * sizeof(float);
+    cl_int err = CL_SUCCESS;
+    cl_mem bw = impl_->weight_buffer(nullptr, (size_t)out_dim * in_dim, tag, true);
+    const bool is_bf16 = impl_->last_bf16 != 0;
+    cl_kernel kern = is_bf16 ? impl_->k_gemm_bf16 : impl_->k_gemm;
+
+    if (impl_->a_cap < a_bytes) {
+        if (impl_->ba) g_api->clReleaseMemObject(impl_->ba);
+        impl_->ba = g_api->clCreateBuffer(impl_->ctx, CL_MEM_READ_ONLY, a_bytes, nullptr, &err);
+        if (err != CL_SUCCESS) throw std::runtime_error("ForwardGpu: buffer A failed");
+        impl_->a_cap = a_bytes;
+    }
+    if (impl_->c_cap < c_bytes) {
+        if (impl_->bc) g_api->clReleaseMemObject(impl_->bc);
+        impl_->bc = g_api->clCreateBuffer(impl_->ctx, CL_MEM_WRITE_ONLY, c_bytes, nullptr, &err);
+        if (err != CL_SUCCESS) throw std::runtime_error("ForwardGpu: buffer C failed");
+        impl_->c_cap = c_bytes;
+    }
+    if (bias) {
+        if (impl_->bias_cap < (size_t)out_dim * sizeof(float) || impl_->bb == nullptr) {
+            if (impl_->bb) g_api->clReleaseMemObject(impl_->bb);
+            impl_->bb = g_api->clCreateBuffer(impl_->ctx, CL_MEM_READ_ONLY,
+                                              (size_t)out_dim * sizeof(float), nullptr, &err);
+            if (err != CL_SUCCESS) throw std::runtime_error("ForwardGpu: buffer bias failed");
+            impl_->bias_cap = (size_t)out_dim * sizeof(float);
+        }
+        g_api->clEnqueueWriteBuffer(impl_->q, impl_->bb, CL_TRUE, 0,
+                                    (size_t)out_dim * sizeof(float), bias, 0, nullptr, nullptr);
+    } else if (impl_->bb == nullptr) {
+        float zero = 0.0f;
+        impl_->bb = g_api->clCreateBuffer(impl_->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                          sizeof(float), &zero, &err);
+        if (err != CL_SUCCESS) throw std::runtime_error("ForwardGpu: buffer bias failed");
+        impl_->bias_cap = sizeof(float);
+    }
+
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->ba, CL_TRUE, 0, a_bytes, A, 0, nullptr, nullptr);
+
+    cl_mem ba = impl_->ba, bb = impl_->bb, bc = impl_->bc;
+    const int has_bias = bias ? 1 : 0;
+    Impl::set_args_checked(kern, ba, bw, bb, bc, seq, in_dim, out_dim, has_bias);
+
+    const size_t lws[2] = {(size_t)TSB, (size_t)TSB};
+    const size_t gsz[2] = {((size_t)out_dim + TSB - 1) / TSB * TSB,
+                           ((size_t)seq + TSB - 1) / TSB * TSB};
+    err = g_api->clEnqueueNDRangeKernel(impl_->q, kern, 2, nullptr, gsz, lws,
+                                        0, nullptr, nullptr);
+    if (err != CL_SUCCESS)
+        throw std::runtime_error("ForwardGpu: enqueue failed (" + std::to_string(err) +
+            ") tag=" + (tag ? tag : "?") + " seq=" + std::to_string(seq) +
+            " in=" + std::to_string(in_dim) + " out=" + std::to_string(out_dim) +
+            " bias=" + std::to_string(has_bias) + " bf16=" + std::to_string((int)is_bf16));
+    g_api->clEnqueueReadBuffer(impl_->q, bc, CL_TRUE, 0, c_bytes, C, 0, nullptr, nullptr);
+    g_api->clFinish(impl_->q);
+}
+
+bool ForwardGpu::weights_fit(size_t total_f32_bytes) const {
+    if (!impl_) return false;
+    // NVIDIA does not answer CL_DEVICE_GLOBAL_MEM_FREE_MEMORY (it returns 0),
+    // so fall back to the total. The card is otherwise idle when this runs.
+    const size_t avail = impl_->dev_free > 0 ? impl_->dev_free : impl_->dev_total;
+    if (avail == 0) return true;   // driver will not say; let the upload decide
+
+    // 95%, leaving room for activations, the KV cache and the output buffers.
+    const double budget = (double)avail * 0.95;
+    // The question is "can the engine run this model", not "can it do so in
+    // f32". f32 is preferred, but bf16 is the fallback — so a model whose f32
+    // form (24.3 GB for the 7B) exceeds a 16 GB card is still viable at bf16
+    // (12.15 GB), and rejecting it there would have been wrong.
+    if ((double)total_f32_bytes <= budget) return true;
+    if (const char* env = std::getenv("WINNEX_GPU_DTYPE")) {
+        if (std::string(env) == "f32") return false;
+        if (std::string(env) == "bf16") return (double)total_f32_bytes * 0.5 <= budget;
+    }
+    return (double)total_f32_bytes * 0.5 <= budget;
+}
+
+void ForwardGpu::release_weights() {
+    if (!impl_) return;
+    for (auto& kv : impl_->tagged) g_api->clReleaseMemObject(kv.second);
+    impl_->tagged.clear();
+    for (auto& kv : impl_->wcache) g_api->clReleaseMemObject(kv.second.mem);
+    impl_->wcache.clear();
+    impl_->bf16_cache = -1;
+    impl_->declared_total_bytes = 0;
+}
+
+size_t ForwardGpu::device_memory_total() const { return impl_ ? impl_->dev_total : 0; }
+size_t ForwardGpu::device_memory_free() const  { return impl_ ? impl_->dev_free : 0; }
+
+size_t ForwardGpu::device_weight_bytes() const {
+    if (!impl_) return 0;
+    // Tagged weights are held by cl_mem only (no host pointer, no element
+    // count), so ask the driver for the allocation size rather than guessing.
+    size_t n = 0;
+    for (auto& kv : impl_->tagged) {
+        size_t bytes = 0;
+        if (g_api->clGetMemObjectInfo(kv.second, CL_MEM_SIZE, sizeof(bytes), &bytes, nullptr)
+                == CL_SUCCESS)
+            n += bytes;
+    }
+    return n;
+}
+bool ForwardGpu::weights_are_bf16() const { return impl_ && impl_->bf16_cache > 0; }
+
 void ForwardGpu::matmul(const float* A, int seq,
                         const float* W, int out_dim, int in_dim,
-                        const float* bias, float* C) {
+                        const float* bias, float* C,
+                        const char* tag) {
     const size_t a_bytes = (size_t)seq * in_dim * sizeof(float);
     const size_t c_bytes = (size_t)seq * out_dim * sizeof(float);
     cl_int err = CL_SUCCESS;
@@ -381,7 +710,7 @@ void ForwardGpu::matmul(const float* A, int seq,
     // Weights are resident: uploaded once per (pointer, size) for the life of
     // the engine. This is the fix for the measured per-call overhead — see the
     // note in Impl::weight_buffer.
-    cl_mem bw = impl_->weight_buffer(W, (size_t)out_dim * in_dim);
+    cl_mem bw = impl_->weight_buffer(W, (size_t)out_dim * in_dim, tag);
 
     // Activation and output buffers are reallocated only when the shape grows.
     // They are pure scratch, so a WRITE_ONLY buffer reused across calls needs
@@ -432,18 +761,24 @@ void ForwardGpu::matmul(const float* A, int seq,
     g_api->clEnqueueWriteBuffer(impl_->q, impl_->ba, CL_TRUE, 0, a_bytes, A, 0, nullptr, nullptr);
 
     cl_mem ba = impl_->ba, bb = impl_->bb, bc = impl_->bc;
-    g_api->clSetKernelArg(impl_->k_gemm, 0, sizeof(cl_mem), &ba);
-    g_api->clSetKernelArg(impl_->k_gemm, 1, sizeof(cl_mem), &bw);
-    g_api->clSetKernelArg(impl_->k_gemm, 2, sizeof(cl_mem), &bb);
-    g_api->clSetKernelArg(impl_->k_gemm, 3, sizeof(cl_mem), &bc);
-    g_api->clSetKernelArg(impl_->k_gemm, 4, sizeof(int), &seq);
-    g_api->clSetKernelArg(impl_->k_gemm, 5, sizeof(int), &in_dim);
-    g_api->clSetKernelArg(impl_->k_gemm, 6, sizeof(int), &out_dim);
-    g_api->clSetKernelArg(impl_->k_gemm, 7, sizeof(int), &has_bias);
+    const bool is_bf16 = impl_->last_bf16 != 0;
+    cl_kernel kern = is_bf16 ? impl_->k_gemm_bf16 : impl_->k_gemm;
+    g_api->clSetKernelArg(kern, 0, sizeof(cl_mem), &ba);
+    g_api->clSetKernelArg(kern, 1, sizeof(cl_mem), &bw);
+    g_api->clSetKernelArg(kern, 2, sizeof(cl_mem), &bb);
+    g_api->clSetKernelArg(kern, 3, sizeof(cl_mem), &bc);
+    g_api->clSetKernelArg(kern, 4, sizeof(int), &seq);
+    g_api->clSetKernelArg(kern, 5, sizeof(int), &in_dim);
+    g_api->clSetKernelArg(kern, 6, sizeof(int), &out_dim);
+    g_api->clSetKernelArg(kern, 7, sizeof(int), &has_bias);
 
-    size_t gsz = (size_t)seq * out_dim;
-    err = g_api->clEnqueueNDRangeKernel(impl_->q, impl_->k_gemm, 1, nullptr, &gsz,
-                                        nullptr, 0, nullptr, nullptr);
+    // 2-D tiled launch: dim0 = output rows, dim1 = sequence rows. The global
+    // size is rounded UP to whole tiles; the kernel masks the edge.
+    const size_t lws[2] = {(size_t)TSB, (size_t)TSB};
+    const size_t gsz[2] = {((size_t)out_dim + TSB - 1) / TSB * TSB,
+                           ((size_t)seq + TSB - 1) / TSB * TSB};
+    err = g_api->clEnqueueNDRangeKernel(impl_->q, kern, 2, nullptr, gsz, lws,
+                                        0, nullptr, nullptr);
     if (err != CL_SUCCESS)
         throw std::runtime_error("ForwardGpu: enqueue failed (" + std::to_string(err) + ")");
     g_api->clEnqueueReadBuffer(impl_->q, bc, CL_TRUE, 0, c_bytes, C, 0, nullptr, nullptr);

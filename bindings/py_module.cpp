@@ -173,7 +173,7 @@ PYBIND11_MODULE(_winnex_nano, m) {
         }, py::arg("v"));
 
     // --- Safetensors loader -------------------------------------------------
-    py::class_<Safetensors>(m, "Safetensors")
+    py::class_<Safetensors>(m, "Safetensors", py::dynamic_attr())
         .def(py::init<std::string>(), py::arg("path"))
         .def("has", &Safetensors::has, py::arg("name"))
         .def("count", &Safetensors::count)
@@ -220,13 +220,26 @@ PYBIND11_MODULE(_winnex_nano, m) {
         //       header = f.read(hlen).decode()
         //   base = np.memmap(path, dtype=np.uint8, mode="r", offset=8+hlen)
         //   st = wn.Safetensors.view(base, header)      # no copy
-        .def_static("view", [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> buf,
-                               const std::string& header) {
+        // The python object that owns the bytes is attached to the returned
+        // Safetensors as `_owner`, so an rvalue buffer cannot leave the view
+        // pointing at freed memory. The first version took the pointer and
+        // dropped the reference:
+        //
+        //     st = wn.Safetensors.view(np.memmap(P, ...), header)   # temp memmap
+        //
+        // the temporary was collected at the end of the expression and the next
+        // to_float() read unmapped pages — SIGSEGV with no Python traceback.
+        .def_static("view", [](py::object owner, const std::string& header) {
+            auto buf = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>::ensure(owner);
+            if (!buf)
+                throw py::type_error("Safetensors.view: buffer must be array-like of uint8");
             auto info = buf.request();
             const uint8_t* p = (const uint8_t*)info.ptr;
-            return py::cast(Safetensors::view(p, (size_t)info.size, header));
+            py::object st = py::cast(Safetensors::view(p, (size_t)info.size, header));
+            st.attr("_owner") = buf;   // keeps the memmap (and the fd) alive
+            return st;
         }, py::arg("buffer"), py::arg("header_json"),
-           "Non-owning view: buffer must outlive the returned Safetensors")
+           "Non-owning view: the buffer is retained, so it may be a temporary")
         .def_static("read_header", [](const std::string& path) {
             uint64_t off = 0;
             std::string h = Safetensors::read_header(path, &off);
@@ -286,6 +299,9 @@ PYBIND11_MODULE(_winnex_nano, m) {
         // float32 RAM; when it does not fit enable_gpu() streams one layer at
         // a time instead of dying with OOM.
         .def_property_readonly("weight_mode", &ForwardEngine::weight_mode)
+        // Bytes of projection weights living on the device in "device" mode.
+        // Diagnostic: it is the number that decides whether the model fits.
+        .def_property_readonly("device_weight_bytes", &ForwardEngine::device_weight_bytes)
         .def_property_readonly("resident_bytes", &ForwardEngine::estimate_resident_bytes)
         .def_static("available_ram_bytes", &ForwardEngine::available_ram_bytes);
 
