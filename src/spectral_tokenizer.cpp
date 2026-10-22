@@ -232,4 +232,71 @@ std::vector<float> SpectralTokenizer::encode_hrr_unit(const std::string& text) c
     return v;
 }
 
+// ── HRR complexo com posição de taxa fixa ─────────────────────────────────
+//
+// Duas correções sobre `encode_hrr`, ambas medidas:
+//
+//   psi = e^{i·2π·j·(byte/256 + pos·stride)}
+//
+// 1. A parte imaginária é ESCRITA, não descartada. O vetor tem 2·embed_dim
+//    floats intercalados. `encode_hrr` devolvia só `re`, o que joga fora
+//    metade do sinal e reduz a norma por componente em ~10x.
+//
+// 2. `pos` entra com uma taxa FIXA (padrão 1/64), não com `pos/n`. Com `pos/n`
+//    o binding posicional depende do comprimento do texto, então o vetor de um
+//    prefixo muda quando o documento cresce — a representação deixa de ser
+//    comparável consigo mesma.
+//
+// A taxa 1/64 foi escolhida para dar meia volta a cada 32 bytes: dois bytes
+// vizinhos ficam bem separados em fase, e a fase não satura dentro de um
+// parágrafo. É um parâmetro explícito para poder ser varrido.
+void SpectralTokenizer::encode_hrr_into_buffer(const std::string& text, float* out,
+                                               double pos_stride) const {
+    const int D = embed_dim_;
+    if (!out || D <= 0) return;
+    const size_t n = text.size();
+    std::vector<double> re(static_cast<size_t>(D), 0.0);
+    std::vector<double> im(static_cast<size_t>(D), 0.0);
+
+    const double tau = 2.0 * static_cast<double>(kPi);
+    for (size_t pos = 0; pos < n; ++pos) {
+        const double b = static_cast<double>(static_cast<unsigned char>(text[pos]));
+        const double p = static_cast<double>(pos) * pos_stride;
+        for (int j = 0; j < D; ++j) {
+            // j é FREQUÊNCIA: cada modo amostra o byte de forma distinta.
+            const double ang = tau * static_cast<double>(j) * (b / 256.0 + p);
+            re[static_cast<size_t>(j)] += std::cos(ang);
+            im[static_cast<size_t>(j)] += std::sin(ang);
+        }
+    }
+
+    // Escala por 1/sqrt(n·D): mantém a energia esperada independente de n e D,
+    // que é o que permite comparar textos de tamanhos diferentes.
+    const double scale = (n > 0) ? 1.0 / std::sqrt(static_cast<double>(n) *
+                                                   static_cast<double>(D))
+                                 : 0.0;
+    for (int j = 0; j < D; ++j) {
+        out[static_cast<size_t>(2 * j)]     = static_cast<float>(re[static_cast<size_t>(j)] * scale);
+        out[static_cast<size_t>(2 * j + 1)] = static_cast<float>(im[static_cast<size_t>(j)] * scale);
+    }
+}
+
+std::vector<float> SpectralTokenizer::encode_hrr_complex(const std::string& text,
+                                                         double pos_stride) const {
+    const int D = embed_dim_;
+    std::vector<float> out(static_cast<size_t>(2 * D), 0.0f);
+    if (text.empty() || D <= 0) return out;
+    encode_hrr_into_buffer(text, out.data(), pos_stride);
+
+    // Normaliza a norma unitária para o contrato de cosseno do Madhava.
+    double ss = 0.0;
+    for (float x : out) ss += static_cast<double>(x) * x;
+    const double nrm = std::sqrt(ss);
+    if (nrm > 1e-12) {
+        const float inv = static_cast<float>(1.0 / nrm);
+        for (float& x : out) x *= inv;
+    }
+    return out;
+}
+
 } // namespace winnex_nano

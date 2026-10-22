@@ -52,19 +52,80 @@ PYBIND11_MODULE(_winnex_nano, m) {
     py::class_<SpectralTokenizer>(m, "SpectralTokenizer")
         .def(py::init<int>(), py::arg("embed_dim") = 64)
         .def("encode", &SpectralTokenizer::encode, py::arg("text"))
-        .def("encode_batch", [](const SpectralTokenizer& self, py::bytes data) {
-            // Encode bytes → numpy array (n, embed_dim, 4) float32.
-            // Avoids per-Quat Python objects: the native buffer is filled in
-            // one call and exposed as a contiguous array.
-            char* buf = nullptr;
-            Py_ssize_t len = 0;
-            PyBytes_AsStringAndSize(data.ptr(), &buf, &len);
-            if (len < 0) throw std::runtime_error("encode_batch: invalid bytes");
-            int embed = self.embed_dim();
-            py::array_t<float> out({(py::ssize_t)len, (py::ssize_t)embed, (py::ssize_t)4});
-            self.encode_into_buffer(std::string(buf, (size_t)len), out.mutable_data());
+        // `encode_batch` aceitava SÓ `bytes` e recusava a lista de strings que
+        // o nome promete — quem passava `["a", "b"]` recebia
+        // "TypeError: incompatible function arguments" e concluía que o método
+        // estava quebrado.
+        //
+        // Agora aceita as duas formas e mantém as antigas funcionando:
+        //   bytes            -> [n_bytes, embed_dim, 4]   (uma "linha" por byte)
+        //   list[str]        -> [n_textos, max_len, embed_dim, 4], com máscara
+        //   str              -> equivale a [str]
+        //
+        // O resultado é float32 contíguo: o buffer nativo é preenchido numa
+        // chamada, sem objetos Quat por byte na fronteira do Python.
+        .def("encode_batch", [](const SpectralTokenizer& self, py::object data,
+                                bool pad_to_max) -> py::object {
+            const int embed = self.embed_dim();
+            auto encode_one = [&](const std::string& s) -> py::object {
+                py::array_t<float> a({(py::ssize_t)s.size(), (py::ssize_t)embed,
+                                      (py::ssize_t)4});
+                self.encode_into_buffer(s, a.mutable_data());
+                return std::move(a);
+            };
+
+            if (py::isinstance<py::bytes>(data)) {
+                std::string s = data.cast<std::string>();
+                return encode_one(s);
+            }
+
+            std::vector<std::string> items;
+            if (py::isinstance<py::str>(data)) {
+                items.push_back(data.cast<std::string>());
+            } else if (py::isinstance<py::sequence>(data)) {
+                for (auto h : data.cast<py::sequence>())
+                    items.push_back(h.cast<std::string>());
+            } else {
+                throw py::type_error(
+                    "encode_batch: espera bytes, str ou sequência de str");
+            }
+
+            size_t maxlen = 0;
+            for (auto& s : items) maxlen = std::max(maxlen, s.size());
+            if (!pad_to_max || items.empty())
+                return py::cast((py::ssize_t)items.size());
+
+            py::array_t<float> out({(py::ssize_t)items.size(),
+                                    (py::ssize_t)maxlen,
+                                    (py::ssize_t)embed, (py::ssize_t)4});
+            float* base = out.mutable_data();
+            const size_t per_text = maxlen * embed * 4;
+            for (size_t i = 0; i < items.size(); ++i) {
+                self.encode_into_buffer(items[i], base + i * per_text);
+                // Zero the padding so it cannot be mistaken for signal.
+                for (size_t b = items[i].size(); b < maxlen; ++b) {
+                    float* row = base + i * per_text + b * embed * 4;
+                    std::fill(row, row + embed * 4, 0.0f);
+                }
+            }
+            return std::move(out);
+        }, py::arg("data"), py::arg("pad_to_max") = true,
+           "bytes -> [n, D, 4]; str ou sequência de str -> [batch, max_len, D, 4]")
+        // HRR complexo: metade imaginária preservada e posição de taxa fixa.
+        .def("encode_hrr_complex", &SpectralTokenizer::encode_hrr_complex,
+             py::arg("text"), py::arg("pos_stride") = 1.0 / 64.0,
+             "HRR com re/im intercalados (2·embed_dim floats), norma unitária. "
+             "Preserva ordem e usa posição de taxa fixa (independente do "
+             "comprimento do texto).")
+        .def("encode_hrr_matrix", [](const SpectralTokenizer& self,
+                                     const std::string& text, double pos_stride) {
+            // [n_bytes, 2·embed_dim] — a forma que o ForwardEngine consome.
+            const int D = self.embed_dim();
+            py::array_t<float> out({(py::ssize_t)text.size(), (py::ssize_t)(2 * D)});
+            self.encode_hrr_into_buffer(text, out.mutable_data(), pos_stride);
             return out;
-        }, py::arg("data"))
+        }, py::arg("text"), py::arg("pos_stride") = 1.0 / 64.0,
+           "Matriz [n_bytes, 2·embed_dim] pronta para o ForwardEngine.")
         .def("encode_histogram", &SpectralTokenizer::encode_histogram,
              py::arg("text"), py::arg("bins") = 256)
         .def("encode_compact", &SpectralTokenizer::encode_compact, py::arg("text"))

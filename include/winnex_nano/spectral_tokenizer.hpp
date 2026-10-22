@@ -161,6 +161,34 @@ public:
     // Devolve `embed_dim()` floats (a parte real do vetor complexo).
     std::vector<float> encode_hrr_unit(const std::string& text) const;
 
+    // ── CORREÇÃO 2026-10-23: HRR complexo e com denominador fixo ──────────
+    //
+    // Dois defeitos medidos na versão em `encode_hrr`:
+    //
+    // 1. DESCARTA A PARTE IMAGINÁRIA.
+    //    Z = Σ e^{i·φ} é complexo. A versão antiga devolvia `re[j]` e jogava
+    //    `im[j]` fora: metade da informação, e a energia de uma senoide some
+    //    junto. Medido em 11 KB de texto: norma do vetor real = 0,2 contra 2,0
+    //    do complexo — 10× menos sinal por componente, antes de qualquer
+    //    normalização. `encode_hrr_complex` devolve a intercalação
+    //    [re0, im0, re1, im1, ...] com 2·embed_dim floats.
+    //
+    // 2. usa `pos/n` como denominador, o que acopla o binding posicional ao
+    //    comprimento do texto: o mesmo prefixo em dois documentos de tamanhos
+    //    diferentes recebe fases diferentes, e uma frase não é comparável
+    //    consigo mesma em contextos distintos. `encode_hrr_fixed` usa uma
+    //    taxa fixa por posição, então o vetor de "a+b" é estável.
+    //
+    // `encode_hrr_complex(text, pos_stride)` faz as duas coisas. A assinatura
+    // antiga fica intocada para não quebrar chamadores.
+    std::vector<float> encode_hrr_complex(const std::string& text,
+                                          double pos_stride = 1.0 / 64.0) const;
+
+    // Matriz [n_bytes, 2·embed_dim] em float32, para alimentar o ForwardEngine
+    // diretamente. É a representação usada pelo benchmark de tokenizadores.
+    void encode_hrr_into_buffer(const std::string& text, float* out,
+                                double pos_stride = 1.0 / 64.0) const;
+
     int embed_dim() const { return embed_dim_; }
     // Number of byte references (0-255).
     static constexpr int kByteRange = 256;
