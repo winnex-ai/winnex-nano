@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from typing import List, Optional
 
@@ -59,6 +60,13 @@ logger = logging.getLogger("winnex-nano")
 app = FastAPI(title="Winnex-Nano", version="0.2.0")
 
 # Filled by build_engine() / the __main__ entrypoint.
+# The engine holds ONE persistent KV cache per instance (prefill resets it),
+# so two concurrent generations on the same engine would interleave tokens into
+# each other's history. This lock serialises them. It is a correctness
+# requirement, not a tuning knob: without it, two simultaneous requests produce
+# silent garbage rather than an error.
+_gen_lock = threading.Lock()
+
 _state = {
     "engine": None,
     "tokenizer": None,
@@ -187,6 +195,25 @@ def _sample(logits, temperature: float, top_k: int):
     return int(np.random.choice(p.size, p=p))
 
 
+def _generate_locked(prompt: str, max_tokens: int, temperature: float,
+                     top_k: int, stop: Optional[List[str]]):
+    """Generates with the engine lock held for the WHOLE sequence.
+
+    The lock cannot be taken inside the loop: it has to span prefill through
+    the last step, because the state that must stay private is the KV cache
+    itself. Held any shorter, a second request would call prefill() — which
+    resets the cache — in the middle of the first one's decode, and the first
+    would continue generating from someone else's prompt with no error.
+
+    Consequence, stated plainly: this server handles ONE generation at a time.
+    A queue, not parallelism. Serving concurrent users needs one engine
+    instance per slot (each with its own KV cache), which costs a full copy of
+    the weights unless they are device-resident.
+    """
+    with _gen_lock:
+        yield from _generate(prompt, max_tokens, temperature, top_k, stop)
+
+
 def _generate(prompt: str, max_tokens: int, temperature: float, top_k: int,
               stop: Optional[List[str]]):
     """Yields decoded text pieces. Runs prefill then step-by-step decode."""
@@ -297,7 +324,7 @@ async def chat_completions(req: ChatRequest):
                         "choices": [{"index": 0, "delta": {"role": "assistant"},
                                      "finish_reason": None}]})
             try:
-                for piece in _generate(prompt, req.max_tokens, req.temperature,
+                for piece in _generate_locked(prompt, req.max_tokens, req.temperature,
                                        req.top_k, req.stop):
                     yield _sse({"id": cid, "object": "chat.completion.chunk",
                                 "created": int(time.time()), "model": model,
@@ -321,7 +348,7 @@ async def chat_completions(req: ChatRequest):
 
     t0 = time.perf_counter()
     try:
-        text = "".join(_generate(prompt, req.max_tokens, req.temperature,
+        text = "".join(_generate_locked(prompt, req.max_tokens, req.temperature,
                                  req.top_k, req.stop))
     except Exception as e:
         logger.exception("generation failed")
