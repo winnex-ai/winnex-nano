@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "winnex_nano/tensor_ops.hpp"
+#include "winnex_nano/forward_gpu.hpp"
 
 namespace winnex_nano {
 
@@ -279,8 +280,14 @@ void ForwardEngine::load_layer(int layer, LayerWeights& w) {
 void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
                               std::vector<float>& k_cache, std::vector<float>& v_cache,
                               int cache_pos) {
-    LayerWeights w;
-    load_layer(layer, w);
+    // GPU path uses the RESIDENT copy so the weight pointers are stable across
+    // calls and the device-side cache hits. The CPU path keeps the historical
+    // per-call load (it costs nothing measurable and avoids holding every
+    // layer's weights in RAM when no GPU is in use).
+    LayerWeights w_scratch;
+    LayerWeights& w = (gpu_ != nullptr && layer < (int)resident_.size())
+                        ? *resident_[layer] : w_scratch;
+    if (&w == &w_scratch) load_layer(layer, w);
     const int H = w.hidden, nh = cfg_.num_attention_heads, nkv = cfg_.num_key_value_heads;
     const int hd = cfg_.head_dim;
 
@@ -290,18 +297,36 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
 
     // 2. QKV projections (dense f32) — batched as (seq*H).
     std::vector<float> q(seq_len * w.q_out), k(seq_len * w.kv_out), v(seq_len * w.kv_out);
-    for (int t = 0; t < seq_len; ++t) {
-        const float* xt = hn.data() + (size_t)t * H;
-        float* qt = q.data() + (size_t)t * w.q_out;
-        float* kt = k.data() + (size_t)t * w.kv_out;
-        float* vt = v.data() + (size_t)t * w.kv_out;
-        dense_matmul(qt, xt, w.q_w.data(), H, w.q_out);
-        dense_matmul(kt, xt, w.k_w.data(), H, w.kv_out);
-        dense_matmul(vt, xt, w.v_w.data(), H, w.kv_out);
-        // Attention biases (Qwen2/Qwen2.5). No-op when the checkpoint has none.
-        if (!w.q_b.empty()) for (int o = 0; o < w.q_out; ++o) qt[o] += w.q_b[o];
-        if (!w.k_b.empty()) for (int o = 0; o < w.kv_out; ++o) kt[o] += w.k_b[o];
-        if (!w.v_b.empty()) for (int o = 0; o < w.kv_out; ++o) vt[o] += w.v_b[o];
+    if (gpu_ != nullptr) {
+        // GPU path: one batched call per projection instead of seq_len calls.
+        // The bias is fused into the kernel, so the CPU-side add loops below
+        // are not executed here.
+        //
+        // Q/K/V have different output widths (q_out = heads*head_dim,
+        // kv_out = kv_heads*head_dim) so they cannot be a single GEMM without
+        // padding buffers to the larger width and slicing after — the padding
+        // costs more bandwidth than the three separate launches.
+        gpu_->matmul(hn.data(), seq_len, w.q_w.data(), w.q_out, H,
+                     w.q_b.empty() ? nullptr : w.q_b.data(), q.data());
+        gpu_->matmul(hn.data(), seq_len, w.k_w.data(), w.kv_out, H,
+                     w.k_b.empty() ? nullptr : w.k_b.data(), k.data());
+        gpu_->matmul(hn.data(), seq_len, w.v_w.data(), w.kv_out, H,
+                     w.v_b.empty() ? nullptr : w.v_b.data(), v.data());
+    } else {
+        for (int t = 0; t < seq_len; ++t) {
+            const float* xt = hn.data() + (size_t)t * H;
+            float* qt = q.data() + (size_t)t * w.q_out;
+            float* kt = k.data() + (size_t)t * w.kv_out;
+            float* vt = v.data() + (size_t)t * w.kv_out;
+            dense_matmul(qt, xt, w.q_w.data(), H, w.q_out);
+            dense_matmul(kt, xt, w.k_w.data(), H, w.kv_out);
+            dense_matmul(vt, xt, w.v_w.data(), H, w.kv_out);
+            // Attention biases (Qwen2/Qwen2.5). No-op when the checkpoint has
+            // none. The GPU path fuses this into the kernel.
+            if (!w.q_b.empty()) for (int o = 0; o < w.q_out; ++o) qt[o] += w.q_b[o];
+            if (!w.k_b.empty()) for (int o = 0; o < w.kv_out; ++o) kt[o] += w.k_b[o];
+            if (!w.v_b.empty()) for (int o = 0; o < w.kv_out; ++o) vt[o] += w.v_b[o];
+        }
     }
 
     // 3. RoPE on Q (all heads) and K (kv heads) at their absolute positions.
@@ -517,9 +542,17 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
 
     // 6. Output projection + residual.
     std::vector<float> proj(seq_len * H);
-    for (int t = 0; t < seq_len; ++t) {
-        dense_matmul(proj.data() + (size_t)t * H, attn_out.data() + (size_t)t * w.q_out,
-                     w.o_w.data(), w.q_out, H);
+    if (gpu_ != nullptr) {
+        // Fourth GPU projection of the layer. o_proj has no bias in any of the
+        // supported architectures (Qwen2/2.5/3, Llama), so the fused-bias path
+        // is not exercised here.
+        gpu_->matmul(attn_out.data(), seq_len, w.o_w.data(), H, w.q_out,
+                     nullptr, proj.data());
+    } else {
+        for (int t = 0; t < seq_len; ++t) {
+            dense_matmul(proj.data() + (size_t)t * H, attn_out.data() + (size_t)t * w.q_out,
+                         w.o_w.data(), w.q_out, H);
+        }
     }
     for (int i = 0; i < seq_len * H; ++i) h[i] += proj[i];
 
@@ -528,19 +561,32 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     rms_norm(hn2.data(), h.data(), w.post_norm.data(), seq_len, H, cfg_.rms_norm_eps);
     std::vector<float> mlp_out(seq_len * H);
     std::vector<float> gate(seq_len * w.inter), up(seq_len * w.inter);
-    for (int t = 0; t < seq_len; ++t) {
-        const float* xt = hn2.data() + (size_t)t * H;
-        dense_matmul(gate.data() + (size_t)t * w.inter, xt, w.g_w.data(), H, w.inter);
-        dense_matmul(up.data() + (size_t)t * w.inter, xt, w.u_w.data(), H, w.inter);
+    if (gpu_ != nullptr) {
+        // gate and up share the same input, so they are two GEMMs against the
+        // same A — the only reason they are not one call is that their output
+        // widths are equal but the weights are separate tensors. The SiLU
+        // gating stays on the CPU (it is elementwise and cheap).
+        gpu_->matmul(hn2.data(), seq_len, w.g_w.data(), w.inter, H, nullptr, gate.data());
+        gpu_->matmul(hn2.data(), seq_len, w.u_w.data(), w.inter, H, nullptr, up.data());
+    } else {
+        for (int t = 0; t < seq_len; ++t) {
+            const float* xt = hn2.data() + (size_t)t * H;
+            dense_matmul(gate.data() + (size_t)t * w.inter, xt, w.g_w.data(), H, w.inter);
+            dense_matmul(up.data() + (size_t)t * w.inter, xt, w.u_w.data(), H, w.inter);
+        }
     }
     for (int i = 0; i < seq_len * w.inter; ++i) {
         float g = gate[i];
-        gate[i] = g / (1.0f + std::exp(-g));  // SiLU
+        gate[i] = g / (1.0f + std::exp(-g));  // SiLU (CPU, elementwise)
         gate[i] *= up[i];
     }
-    for (int t = 0; t < seq_len; ++t) {
-        dense_matmul(mlp_out.data() + (size_t)t * H, gate.data() + (size_t)t * w.inter,
-                     w.d_w.data(), w.inter, H);
+    if (gpu_ != nullptr) {
+        gpu_->matmul(gate.data(), seq_len, w.d_w.data(), H, w.inter, nullptr, mlp_out.data());
+    } else {
+        for (int t = 0; t < seq_len; ++t) {
+            dense_matmul(mlp_out.data() + (size_t)t * H, gate.data() + (size_t)t * w.inter,
+                         w.d_w.data(), w.inter, H);
+        }
     }
     for (int i = 0; i < seq_len * H; ++i) h[i] += mlp_out[i];
 }
@@ -585,6 +631,39 @@ std::vector<float> ForwardEngine::forward(const std::vector<float>& hidden,
     }
     return logits;
 }
+
+ForwardEngine::~ForwardEngine() {
+    delete gpu_;      // releases the OpenCL context, program and kernel
+    gpu_ = nullptr;
+}
+
+// ── GPU projections ────────────────────────────────────────────────────────
+// Enables OpenCL for the four attention projections of every layer. Throws
+// when the device cannot be brought up — there is no CPU fallback, by design
+// (see the header comment in forward_gpu.cpp).
+void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
+    if (gpu_ != nullptr) return;
+    gpu_ = new ForwardGpu(opencl_lib);
+
+    // Load every layer ONCE and keep it. run_layer() would otherwise build a
+    // fresh LayerWeights per call, giving each weight tensor a new host address
+    // and defeating the device-side weight cache — measured: the GPU path ran
+    // 0.80x the CPU speed because all 168 weight uploads happened per forward.
+    if (!layers_resident_) {
+        resident_.resize((size_t)cfg_.num_hidden_layers);
+        for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
+            resident_[(size_t)l] = std::make_unique<LayerWeights>();
+            load_layer(l, *resident_[(size_t)l]);
+        }
+        layers_resident_ = true;
+    }
+}
+
+bool ForwardEngine::gpu_enabled() const { return gpu_ != nullptr; }
+std::string ForwardEngine::gpu_device() const {
+    return gpu_ ? gpu_->device_name() : std::string();
+}
+std::string ForwardEngine::gpu_reason() const { return ForwardGpu::reason(); }
 
 void ForwardEngine::reset_cache() {
     const int kv_out = cfg_.head_dim * cfg_.num_key_value_heads;

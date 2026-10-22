@@ -24,6 +24,7 @@
 #define WINNEX_NANO_FORWARD_HPP
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,7 @@ ModelConfig load_config(const std::string& config_path);
 class ForwardEngine {
 public:
     ForwardEngine(const ModelConfig& cfg, const Safetensors& st);
+    ~ForwardEngine();
 
     // Runs the forward pass on a batch of hidden states [seq, hidden_size]
     // with a FRESH (local) KV cache. Returns logits [vocab_size] for the LAST
@@ -102,10 +104,26 @@ public:
     // Number of parameters (approx, from loaded tensors).
     size_t param_count() const { return param_count_; }
 
+    // ── GPU projections (OpenCL) ──────────────────────────────────────────
+    // When enabled, the four attention projections of every layer (Q, K, V, O)
+    // run on the device instead of `dense_matmul`. RoPE, the causal mask,
+    // softmax, residuals and the KV cache stay on the CPU — see the note at
+    // the top of forward_gpu.cpp for why the split is drawn there.
+    //
+    // `opencl_lib` is the loader to dlopen; empty resolves via
+    // $WINNEX_OPENCL_LIB then the vendor ICD names. There is NO silent CPU
+    // fallback: if the device cannot be brought up this throws, so a benchmark
+    // can never mistake CPU work for GPU work.
+    void enable_gpu(const std::string& opencl_lib = "");
+    bool gpu_enabled() const;
+    std::string gpu_reason() const;
+    std::string gpu_device() const;
+
 private:
     ModelConfig cfg_;
     const Safetensors* st_;
     size_t param_count_ = 0;
+    class ForwardGpu* gpu_ = nullptr;    // owned; null when not enabled
 
     // Precomputed model-wide tensors (loaded once in the constructor).
     std::vector<float> final_norm_;      // model.norm.weight [hidden]
@@ -118,6 +136,18 @@ private:
 
     // Lazy-loaded weight views (kept for the duration of a forward).
     struct LayerWeights;
+
+    // Resident layer weights, used only on the GPU path.
+    //
+    // run_layer() builds a fresh LayerWeights per call, which gives every
+    // weight tensor a NEW host address on every forward. The device-side weight
+    // cache is keyed by host pointer, so with per-call weights it never hits and
+    // all 168 weight uploads happen per forward — measured, that made the GPU
+    // path 0.80x the CPU speed. Loading the layers once and keeping them alive
+    // gives stable addresses, so each weight uploads exactly once.
+    std::vector<std::unique_ptr<LayerWeights>> resident_;
+    bool layers_resident_ = false;
+
     void load_layer(int layer, LayerWeights& w);
 
     // Core ops.

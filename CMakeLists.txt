@@ -91,9 +91,17 @@ add_library(winnex_nano
     src/x_factor.cpp
     src/safetensors.cpp
     src/forward.cpp
+    # OpenCL dense projections for the forward pass. The loader is resolved at
+    # RUNTIME (dlopen/LoadLibrary), so there is no link-time OpenCL dependency
+    # and the wheel stays portable — see the note at the top of forward_gpu.cpp.
+    src/forward_gpu.cpp
 )
 target_include_directories(winnex_nano PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# CL/cl.h for forward_gpu.cpp. winnex-madhava vendors the headers and is
+# fetched by the CMakeLists above, so the path is always available.
+target_include_directories(winnex_nano PRIVATE ${MADHAVA_ROOT}/vendor)
 target_link_libraries(winnex_nano PUBLIC madhava_reused)
+target_link_libraries(winnex_nano PRIVATE ${CMAKE_DL_LIBS})
 
 # --- Python bindings (pybind11) --------------------------------------------
 # scikit-build-core sets up Python3_ROOT_DIR / Python_EXECUTABLE in the build

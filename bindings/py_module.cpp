@@ -249,7 +249,14 @@ PYBIND11_MODULE(_winnex_nano, m) {
         }, py::arg("h_prompt"), py::arg("max_new_tokens"), py::arg("eos_id") = -1)
         .def("reset_cache", &ForwardEngine::reset_cache)
         .def_static("argmax", &ForwardEngine::argmax, py::arg("logits"))
-        .def_property_readonly("param_count", &ForwardEngine::param_count);
+        .def_property_readonly("param_count", &ForwardEngine::param_count)
+        // GPU projections (Q/K/V/O per layer). Throws if no device — there is
+        // no silent CPU fallback, so a benchmark can never mistake CPU work
+        // for GPU work.
+        .def("enable_gpu", &ForwardEngine::enable_gpu, py::arg("opencl_lib") = "")
+        .def_property_readonly("gpu_enabled", &ForwardEngine::gpu_enabled)
+        .def_property_readonly("gpu_device", &ForwardEngine::gpu_device)
+        .def_property_readonly("gpu_reason", &ForwardEngine::gpu_reason);
 
     // --- Free functions -----------------------------------------------------
     m.def("expand_spectral", [](py::array_t<float> psi, int d, int D) {
