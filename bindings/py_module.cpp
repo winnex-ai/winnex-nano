@@ -191,23 +191,48 @@ PYBIND11_MODULE(_winnex_nano, m) {
         }, py::arg("name"))
         .def("read_rows", [](const Safetensors& st, const std::string& name,
                              int row_start, int n_rows) {
-            // Reads n_rows rows [row_start, row_start+n_rows) of a 2D tensor
-            // WITHOUT materializing the full tensor in Python. Returns a
-            // (n_rows, cols) float32 numpy array. This is the memory-bounded
-            // path for converting giant tensors (embed_tokens).
+            // Row-bounded read. MEMORY FIX (2026-10-22): the previous version
+            // called st.to_float(t) — which materialises the FULL tensor —
+            // and then copied the rows out. For embed_tokens of Qwen2.5-7B that
+            // is 152.064 x 3.584 = 2.2 GB allocated and freed on every call,
+            // which is exactly what pushed the 7B benchmark into OOM.
+            // Safetensors::read_rows converts only the requested rows.
             const auto& t = st.get(name);
-            if (t.shape.size() != 2) throw std::runtime_error("read_rows: tensor must be 2D");
-            int rows = (int)t.shape[0];
-            int cols = (int)t.shape[1];
-            if (row_start < 0 || n_rows < 0 || row_start + n_rows > rows)
-                throw std::runtime_error("read_rows: out of range");
-            auto all = st.to_float(t);  // full tensor in C++ (freed after)
+            const int cols = (int)t.shape[1];
+            auto rows = st.read_rows(t, row_start, n_rows);   // (n_rows * cols)
             py::array_t<float> out({(py::ssize_t)n_rows, (py::ssize_t)cols});
-            std::memcpy(out.mutable_data(),
-                        all.data() + (size_t)row_start * cols,
-                        (size_t)n_rows * cols * sizeof(float));
+            std::memcpy(out.mutable_data(), rows.data(),
+                        rows.size() * sizeof(float));
             return out;
-        }, py::arg("name"), py::arg("row_start"), py::arg("n_rows"));
+        }, py::arg("name"), py::arg("row_start"), py::arg("n_rows"))
+        // Non-owning view over a caller-owned buffer (np.memmap).
+        //
+        // This is the MadhavaL2 contract applied to weights: the caller owns
+        // the pointer, the engine never copies. With an np.memmap the kernel
+        // pages the payload in on access, so RSS tracks the working set
+        // (a few layers) instead of the 14.2 GB file.
+        //
+        // The buffer MUST outlive the returned object. Typical use:
+        //
+        //   import struct, numpy as np, winnex_nano as wn
+        //   with open(path, "rb") as f:
+        //       hlen = struct.unpack("<Q", f.read(8))[0]
+        //       header = f.read(hlen).decode()
+        //   base = np.memmap(path, dtype=np.uint8, mode="r", offset=8+hlen)
+        //   st = wn.Safetensors.view(base, header)      # no copy
+        .def_static("view", [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> buf,
+                               const std::string& header) {
+            auto info = buf.request();
+            const uint8_t* p = (const uint8_t*)info.ptr;
+            return py::cast(Safetensors::view(p, (size_t)info.size, header));
+        }, py::arg("buffer"), py::arg("header_json"),
+           "Non-owning view: buffer must outlive the returned Safetensors")
+        .def_static("read_header", [](const std::string& path) {
+            uint64_t off = 0;
+            std::string h = Safetensors::read_header(path, &off);
+            return py::make_tuple(h, (long long)off);
+        }, py::arg("path"),
+           "Read only the header JSON (+ payload offset), leaving the payload on disk");
 
     // --- ModelConfig + load_config -----------------------------------------
     py::class_<ModelConfig>(m, "ModelConfig")
@@ -256,7 +281,13 @@ PYBIND11_MODULE(_winnex_nano, m) {
         .def("enable_gpu", &ForwardEngine::enable_gpu, py::arg("opencl_lib") = "")
         .def_property_readonly("gpu_enabled", &ForwardEngine::gpu_enabled)
         .def_property_readonly("gpu_device", &ForwardEngine::gpu_device)
-        .def_property_readonly("gpu_reason", &ForwardEngine::gpu_reason);
+        .def_property_readonly("gpu_reason", &ForwardEngine::gpu_reason)
+        // "cpu" | "resident" | "stream". Residency needs the whole model in
+        // float32 RAM; when it does not fit enable_gpu() streams one layer at
+        // a time instead of dying with OOM.
+        .def_property_readonly("weight_mode", &ForwardEngine::weight_mode)
+        .def_property_readonly("resident_bytes", &ForwardEngine::estimate_resident_bytes)
+        .def_static("available_ram_bytes", &ForwardEngine::available_ram_bytes);
 
     // --- Free functions -----------------------------------------------------
     m.def("expand_spectral", [](py::array_t<float> psi, int d, int D) {

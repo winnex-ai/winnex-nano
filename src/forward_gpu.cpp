@@ -254,25 +254,53 @@ struct ForwardGpu::Impl {
     // that loads weights per layer (as ForwardEngine does) gets a fresh
     // LayerWeights each time, so the pointers change and the cache would thrash.
     // ForwardEngine therefore keeps its layers resident — see enable_gpu().
-    std::unordered_map<const void*, std::pair<cl_mem, size_t>> wcache;
     // Reusable scratch (activations / output / bias), grown on demand.
     cl_mem ba = nullptr, bc = nullptr, bb = nullptr;
     size_t a_cap = 0, c_cap = 0, bias_cap = 0;
 
+    // Cache key: pointer + size + CONTENT FINGERPRINT.
+    //
+    // Pointer+size alone is not enough. In STREAM mode ForwardEngine builds a
+    // fresh LayerWeights per call and frees it, so the allocator hands the SAME
+    // address to layer L+1 next time round. The cache then returned layer L's
+    // device buffer for layer L+1's weights — measured: perplexity 43,384,515
+    // instead of 18.98, i.e. total garbage, with no error raised.
+    //
+    // The fingerprint is a cheap FNV-1a over a strided sample of the matrix
+    // (up to 4096 floats). It is not cryptographic — it only has to distinguish
+    // "this is a different layer's weight" from "same weight, same address".
+    struct Entry { cl_mem mem; size_t n; uint64_t fp; };
+    std::unordered_map<const void*, Entry> wcache;
+
+    static uint64_t fingerprint(const float* W, size_t n) {
+        uint64_t h = 1469598103934665603ull;
+        const size_t stride = (n > 4096) ? (n / 4096) : 1;
+        for (size_t i = 0; i < n; i += stride) {
+            uint32_t bits;
+            std::memcpy(&bits, W + i, 4);
+            h ^= bits; h *= 1099511628211ull;
+        }
+        // Include the length so two matrices of different size never collide.
+        h ^= (uint64_t)n; h *= 1099511628211ull;
+        return h;
+    }
+
     cl_mem weight_buffer(const float* W, size_t n_floats) {
+        const uint64_t fp = fingerprint(W, n_floats);
         auto it = wcache.find((const void*)W);
-        if (it != wcache.end() && it->second.second == n_floats) return it->second.first;
+        if (it != wcache.end() && it->second.n == n_floats && it->second.fp == fp)
+            return it->second.mem;
         cl_int err = CL_SUCCESS;
         cl_mem b = g_api->clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                          n_floats * sizeof(float), (void*)W, &err);
         if (err != CL_SUCCESS) throw std::runtime_error("ForwardGpu: weight buffer failed");
-        if (it != wcache.end()) g_api->clReleaseMemObject(it->second.first);
-        wcache[(const void*)W] = {b, n_floats};
+        if (it != wcache.end()) g_api->clReleaseMemObject(it->second.mem);
+        wcache[(const void*)W] = {b, n_floats, fp};
         return b;
     }
 
     ~Impl() {
-        for (auto& kv : wcache) g_api->clReleaseMemObject(kv.second.first);
+        for (auto& kv : wcache) g_api->clReleaseMemObject(kv.second.mem);
         if (ba) g_api->clReleaseMemObject(ba);
         if (bc) g_api->clReleaseMemObject(bc);
         if (bb) g_api->clReleaseMemObject(bb);

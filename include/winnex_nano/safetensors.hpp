@@ -39,17 +39,52 @@ struct SafeTensor {
     std::vector<int64_t> data_offsets;  // [begin, end) into the shared data blob
 };
 
+// Immutable view over a .safetensors file.
+//
+// TWO OWNERSHIP MODES, the caller picks:
+//
+//   Safetensors(path)            copies the payload into an owned vector.
+//                                Simple, safe, and wrong at scale: Qwen2.5-7B
+//                                is 14.2 GB resident before any weight is used.
+//
+//   Safetensors::view(ptr, len)  takes a POINTER to memory the caller owns and
+//                                never copies. This is the MadhavaL2 contract —
+//                                "the caller owns the data pointer; the engine
+//                                never copies the corpus" — applied to weights.
+//
+// The view mode is what makes mmap possible: the Python side opens an
+// np.memmap over the payload and passes its address; the kernel pages it in on
+// access and evicts clean pages under pressure, so RSS tracks the working set
+// (a few layers) instead of the file size.
+//
+// The payload in view mode MUST outlive this object. That is the same contract
+// MadhavaL2::build() has with its raw_base.
 class Safetensors {
 public:
-    // Loads a .safetensors file: parses the header, keeps the data blob.
-    // The blob stays in memory (mmap-friendly: the file is read once).
+    // Copies the payload into memory (the historical behaviour).
     explicit Safetensors(const std::string& path);
+    Safetensors() = default;      // empty; used internally by view()
+
+    // Non-owning view. `data` points at the payload bytes (i.e. the file
+    // content AFTER the 8-byte header length + header JSON); `len` is the
+    // payload length. `header_json` is the header text. Neither is copied.
+    static Safetensors view(const uint8_t* data, size_t len,
+                            const std::string& header_json);
+
+    // Reads ONLY the 8-byte header length + header JSON from `path` — a few KB.
+    // Use this to learn the payload offset before mapping it on the caller side.
+    static std::string read_header(const std::string& path, uint64_t* payload_offset);
 
     bool has(const std::string& name) const { return tensors_.count(name) > 0; }
+    const SafeTensor& get(const SafeTensor& t) const { return t; }
     const SafeTensor& get(const std::string& name) const;
-    const std::vector<uint8_t>& data() const { return data_; }
     const std::map<std::string, SafeTensor>& tensors() const { return tensors_; }
     size_t count() const { return tensors_.size(); }
+
+    // Base pointer of the payload (owned or borrowed — check owns_data()).
+    const uint8_t* data() const { return data_ptr_; }
+    size_t data_size() const { return data_size_; }
+    bool owns_data() const { return owned_.size() > 0; }
 
     // Convenience: reinterpret the tensor bytes as float (converts f16/bf16/f32).
     // For I32 (GPTQ-packed) the bytes are returned as-is (use as int32).
@@ -57,8 +92,15 @@ public:
     std::vector<float> to_float(const SafeTensor& t) const;
     std::vector<int32_t> to_int32(const SafeTensor& t) const;
 
+    // Row-bounded read: converts ONLY rows [row_start, row_start+n_rows) of a
+    // 2D tensor, leaving the full tensor unmaterialized on the Python side.
+    std::vector<float> read_rows(const SafeTensor& t, int row_start, int n_rows) const;
+
 private:
-    std::vector<uint8_t> data_;
+    void parse_header(const std::string& header);
+    std::vector<uint8_t> owned_;      // empty in view mode
+    const uint8_t* data_ptr_ = nullptr;
+    size_t data_size_ = 0;
     std::map<std::string, SafeTensor> tensors_;
 };
 

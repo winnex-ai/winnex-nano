@@ -645,18 +645,84 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
     if (gpu_ != nullptr) return;
     gpu_ = new ForwardGpu(opencl_lib);
 
-    // Load every layer ONCE and keep it. run_layer() would otherwise build a
-    // fresh LayerWeights per call, giving each weight tensor a new host address
-    // and defeating the device-side weight cache — measured: the GPU path ran
-    // 0.80x the CPU speed because all 168 weight uploads happened per forward.
-    if (!layers_resident_) {
-        resident_.resize((size_t)cfg_.num_hidden_layers);
-        for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
-            resident_[(size_t)l] = std::make_unique<LayerWeights>();
-            load_layer(l, *resident_[(size_t)l]);
+    //
+    // RESIDENT vs STREAM — decided by whether the weights FIT.
+    //
+    // Residency exists for one reason: run_layer() builds a fresh LayerWeights
+    // per call, which gives every weight tensor a new host address and defeats
+    // the device-side weight cache. Measured on Qwen2.5-0.5B, uploading all 168
+    // weight matrices per forward made the GPU path 0.80x the CPU — SLOWER.
+    // Holding them resident gave 2.47x.
+    //
+    // But residency costs RAM equal to the whole model in float32. For
+    // Qwen2.5-7B that is 14.9 GB, on top of the 14.2 GB the Safetensors copy
+    // already holds — 29.1 GB against 16 GB on Kaggle. Measured: "Kernel died".
+    //
+    // So: estimate the cost and only go resident when it fits. Otherwise fall
+    // back to STREAMING, which is what the CPU path already does via
+    // w_scratch: load one layer, use it, free it. Streaming is slower (the
+    // device weight cache misses once per layer per forward) but it RUNS.
+    //
+    // The threshold uses 60% of available RAM, leaving room for the activations
+    // and the OpenCL driver's own allocations.
+    const double bytes_resident = estimate_resident_bytes();
+    const double ram_avail = available_ram_bytes();
+    const double budget = ram_avail * 0.60;
+
+    if (bytes_resident <= budget) {
+        if (!layers_resident_) {
+            resident_.resize((size_t)cfg_.num_hidden_layers);
+            for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
+                resident_[(size_t)l] = std::make_unique<LayerWeights>();
+                load_layer(l, *resident_[(size_t)l]);
+            }
+            layers_resident_ = true;
         }
-        layers_resident_ = true;
+        weight_mode_ = "resident";
+    } else {
+        // Streaming: run_layer falls through to w_scratch (one layer at a time)
+        // because resident_ stays empty.
+        weight_mode_ = "stream";
     }
+}
+
+// Byte cost of holding every layer resident in float32.
+//
+// The projection shapes are q_proj [H, H], k_proj [kv, H], v_proj [kv, H],
+// o_proj [H, H], gate/up [inter, H], down [H, inter]. That is 2·H² + 2·H·kv
+// for attention and 3·H·inter for the MLP — NOT 4·H², which double-counts one
+// H×H (I wrote that first and it over-estimated the 7B by 2.7 GB).
+double ForwardEngine::estimate_resident_bytes() const {
+    const double H = (double)cfg_.hidden_size;
+    const double inter = (double)cfg_.intermediate_size;
+    const double kv = (double)cfg_.head_dim * (double)cfg_.num_key_value_heads;
+    const double per_layer = 2.0 * H * H      // q_proj + o_proj
+                           + 2.0 * H * kv     // k_proj + v_proj
+                           + 3.0 * H * inter  // gate + up + down
+                           + 2.0 * H          // in_norm + post_norm
+                           + 2.0 * kv         // k/v biases
+                           + 1.0 * H;         // q bias
+    return per_layer * (double)cfg_.num_hidden_layers * 4.0;   // float32
+}
+
+// RAM the process can still allocate, from /proc/meminfo MemAvailable.
+double ForwardEngine::available_ram_bytes() {
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    while (f >> key) {
+        if (key == "MemAvailable:") {
+            double kb = 0;
+            f >> kb;
+            return kb * 1024.0;
+        }
+        std::string rest;
+        std::getline(f, rest);
+    }
+    return -1.0;   // unknown: caller treats as "do not go resident"
+}
+
+std::string ForwardEngine::weight_mode() const {
+    return weight_mode_.empty() ? "cpu" : weight_mode_;
 }
 
 bool ForwardEngine::gpu_enabled() const { return gpu_ != nullptr; }

@@ -116,6 +116,15 @@ public:
     // can never mistake CPU work for GPU work.
     void enable_gpu(const std::string& opencl_lib = "");
     bool gpu_enabled() const;
+    // "cpu" | "resident" | "stream" — which weight strategy is active.
+    // Residency needs the whole model in float32 RAM; when it does not fit,
+    // enable_gpu() streams one layer at a time instead of failing.
+    std::string weight_mode() const;
+    // Byte cost of holding every layer resident (float32), and the RAM the
+    // process can still allocate. Public so a caller can decide before calling
+    // enable_gpu().
+    double estimate_resident_bytes() const;
+    static double available_ram_bytes();
     std::string gpu_reason() const;
     std::string gpu_device() const;
 
@@ -147,6 +156,7 @@ private:
     // gives stable addresses, so each weight uploads exactly once.
     std::vector<std::unique_ptr<LayerWeights>> resident_;
     bool layers_resident_ = false;
+    std::string weight_mode_;   // "cpu" | "resident" | "stream"
 
     void load_layer(int layer, LayerWeights& w);
 
