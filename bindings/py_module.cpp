@@ -353,6 +353,24 @@ PYBIND11_MODULE(_winnex_nano, m) {
         // "cpu" | "resident" | "stream". Residency needs the whole model in
         // float32 RAM; when it does not fit enable_gpu() streams one layer at
         // a time instead of dying with OOM.
+        // Token-id interface: a caller with a tokenizer never has to reach
+        // into the safetensors file to build hidden states.
+        .def("embed_ids", [](const ForwardEngine& e, const std::vector<int>& ids) {
+            py::array_t<float> out(std::vector<py::ssize_t>{
+                    (py::ssize_t)ids.size(), (py::ssize_t)e.hidden_size()});
+            auto v = e.embed_ids(ids);
+            std::memcpy(out.mutable_data(), v.data(), v.size() * sizeof(float));
+            return out;
+        }, py::arg("ids"))
+        .def("prefill", &ForwardEngine::prefill, py::arg("ids"),
+             "Embed ids, run the prompt through all layers with the KV cache, "
+             "return logits for the last id. Resets the cache first.")
+        .def("step", &ForwardEngine::step, py::arg("token_id"),
+             "Decode one token against the KV cache filled by prefill().")
+        .def("reset_cache", &ForwardEngine::reset_cache)
+        .def_property_readonly("hidden_size", &ForwardEngine::hidden_size)
+        .def_property_readonly("vocab_size", &ForwardEngine::vocab_size)
+        .def_property_readonly("max_context", &ForwardEngine::max_context)
         .def_property_readonly("weight_mode", &ForwardEngine::weight_mode)
         // Bytes of projection weights living on the device in "device" mode.
         // Diagnostic: it is the number that decides whether the model fits.
@@ -361,11 +379,35 @@ PYBIND11_MODULE(_winnex_nano, m) {
         .def_static("available_ram_bytes", &ForwardEngine::available_ram_bytes);
 
     // --- Free functions -----------------------------------------------------
-    m.def("expand_spectral", [](py::array_t<float> psi, int d, int D) {
-        py::array_t<float> out(D);
-        expand_spectral((const float*)psi.request().ptr, d, out.mutable_data(), D);
+    // `d` is now optional and can no longer exceed the buffer.
+    //
+    // The binding used to take (psi, d, D) and pass a bare pointer with no
+    // length, so expand_spectral read past the array whenever d > len(psi):
+    //
+    //     psi = tok.encode_histogram(text)   # 256 floats
+    //     expand_spectral(psi, 896, 896)     # 640 floats of heap garbage
+    //
+    // which returned 896 NaNs and became `prob = nan` downstream with nothing
+    // raised. The length now comes from numpy and a bad `d` is a Python
+    // exception, not a memory read.
+    m.def("expand_spectral", [](py::array_t<float, py::array::c_style | py::array::forcecast> psi,
+                                int d, int D) {
+        auto info = psi.request();
+        const int psi_len = (int)info.size;
+        const int take = (d < 0) ? psi_len : d;   // d < 0 => whole buffer
+        if (take > psi_len)
+            throw py::value_error(
+                "expand_spectral: d=" + std::to_string(take) + " exceeds the " +
+                std::to_string(psi_len) + " elements in psi");
+        const int out_dim = (D < 0) ? take : D;
+        if (out_dim <= 0) throw py::value_error("expand_spectral: D must be > 0");
+        py::array_t<float> out(out_dim);
+        expand_spectral((const float*)info.ptr, psi_len, take, out.mutable_data(), out_dim);
         return out;
-    }, py::arg("psi"), py::arg("d"), py::arg("D"));
+    }, py::arg("psi"), py::arg("d") = -1, py::arg("D") = -1,
+       "Zero-pad the first d elements of psi to D and L2-normalize.\n"
+       "d defaults to len(psi), D defaults to d. Raises ValueError when "
+       "d > len(psi) -- reading past the buffer used to return NaNs silently.");
 
     // sample_embeddings: reads a row-major tensor from the Safetensors and
     // returns N rows sampled WITHOUT materializing the full tensor in Python.

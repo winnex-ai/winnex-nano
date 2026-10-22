@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace winnex_nano {
 
@@ -171,15 +172,43 @@ void XFactor::project_batch(const float* in, float* out, int n) const {
     for (int i = 0; i < n; ++i) project(in + (size_t)i * dim_, out + (size_t)i * dim_);
 }
 
-void expand_spectral(const float* psi, int d, float* out, int D) {
-    if (!psi || !out) return;
+void expand_spectral(const float* psi, int psi_len, int d, float* out, int D) {
+    // ── Validation, before a single byte is written ────────────────────────
+    if (!psi || !out)
+        throw std::invalid_argument("expand_spectral: null pointer");
+    if (psi_len < 0 || d < 0 || D <= 0)
+        throw std::invalid_argument("expand_spectral: negative length or D <= 0");
+    // The one that was silently corrupting memory. `d` says how many elements
+    // to take; `psi_len` says how many exist. Taking more than exist reads the
+    // heap past the array, and the resulting NaN is indistinguishable from a
+    // legitimate activation from the caller's side.
+    if (d > psi_len) {
+        throw std::invalid_argument(
+            "expand_spectral: d=" + std::to_string(d) +
+            " exceeds the " + std::to_string(psi_len) +
+            " elements in psi (would read " + std::to_string(d - psi_len) +
+            " floats past the buffer)");
+    }
+
     std::memset(out, 0, (size_t)D * sizeof(float));
-    int n = std::min(d, D);
-    for (int j = 0; j < n; ++j) out[j] = psi[j];
-    // L2 normalize the expanded vector.
+    const int n = std::min(d, D);
+    for (int j = 0; j < n; ++j) {
+        const float v = psi[j];
+        if (!std::isfinite(v))
+            throw std::invalid_argument(
+                "expand_spectral: psi[" + std::to_string(j) + "] is not finite");
+        out[j] = v;
+    }
+
     float norm = 0.0f;
     for (int j = 0; j < D; ++j) norm += out[j] * out[j];
-    norm = std::sqrt(norm) + 1e-9f;
+    norm = std::sqrt(norm);
+    // An all-zero source has no direction to normalize. The old code added
+    // 1e-9 and divided by it, which returned 1e9-scale garbage instead of
+    // saying the input carried no information.
+    if (!(norm > 0.0f))
+        throw std::invalid_argument(
+            "expand_spectral: psi is all zeros (no unit vector exists)");
     for (int j = 0; j < D; ++j) out[j] /= norm;
 }
 

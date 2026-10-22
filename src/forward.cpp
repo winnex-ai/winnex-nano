@@ -1012,6 +1012,62 @@ void ForwardEngine::reset_cache() {
     ctx_len_ = 0;
 }
 
+std::vector<float> ForwardEngine::embed_ids(const std::vector<int>& ids) const {
+    const int H = cfg_.hidden_size;
+    const SafeTensor& t = st_->get(kEmbedName);
+    const int rows = (int)t.shape[0];
+    std::vector<float> out((size_t)ids.size() * H);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const int id = ids[i];
+        if (id < 0 || id >= rows)
+            throw std::invalid_argument("ForwardEngine::embed_ids: token id " +
+                                        std::to_string(id) + " outside [0, " +
+                                        std::to_string(rows) + ")");
+        std::vector<float> row = st_->read_rows(t, id, 1);
+        std::memcpy(out.data() + i * H, row.data(), (size_t)H * sizeof(float));
+    }
+    return out;
+}
+
+std::vector<float> ForwardEngine::prefill(const std::vector<int>& ids) {
+    if (ids.empty())
+        throw std::invalid_argument("ForwardEngine::prefill: empty prompt");
+    reset_cache();
+
+    const int H = cfg_.hidden_size;
+    const int n = (int)ids.size();
+    const int kv_out = cfg_.head_dim * cfg_.num_key_value_heads;
+
+    // Persistent caches sized for the whole prompt. forward_next() grows them
+    // from here as decode continues.
+    k_caches_.assign(cfg_.num_hidden_layers, std::vector<float>((size_t)n * kv_out));
+    v_caches_.assign(cfg_.num_hidden_layers, std::vector<float>((size_t)n * kv_out));
+
+    std::vector<float> h = embed_ids(ids);
+    for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
+        run_layer(layer, h, n, k_caches_[layer], v_caches_[layer], 0);
+    }
+    ctx_len_ = n;
+
+    std::vector<float> hnorm(H);
+    rms_norm(hnorm.data(), h.data() + (size_t)(n - 1) * H, final_norm_.data(),
+             1, H, cfg_.rms_norm_eps);
+    std::vector<float> logits(cfg_.vocab_size);
+    lm_head_logits(hnorm.data(), logits.data(), 1, H);
+    return logits;
+}
+
+std::vector<float> ForwardEngine::step(int token_id) {
+    if (ctx_len_ <= 0)
+        throw std::logic_error("ForwardEngine::step: call prefill() first");
+    if (ctx_len_ >= cfg_.max_position_embeddings && cfg_.max_position_embeddings > 0)
+        throw std::out_of_range(
+            "ForwardEngine::step: context is full (" +
+            std::to_string(cfg_.max_position_embeddings) + " positions)");
+    std::vector<float> h = embed_ids({token_id});
+    return forward_next(h);
+}
+
 std::vector<float> ForwardEngine::forward_next(const std::vector<float>& hidden) {
     const int H = cfg_.hidden_size;
     if ((int)hidden.size() != H) {

@@ -81,6 +81,31 @@ public:
     std::vector<float> forward(const std::vector<float>& hidden, int seq_len,
                                bool all_positions = false);
 
+    // ── Token-id interface ─────────────────────────────────────────────────
+    //
+    // A caller holding token ids (a tokenizer, an HTTP request, a benchmark)
+    // should never have to reach into the safetensors file to build hidden
+    // states. These three calls are the whole contract:
+
+    //   reset_cache()                    start a conversation
+    //   prefill(token_ids) -> logits     process the prompt, fill the KV cache
+    //   step(next_id)      -> logits     one token, using the cache
+    //
+    // embed_ids reads ONLY the rows it needs, through the offset table, so a
+    // 152k-row table costs H floats per token instead of 2.18 GB.
+
+    // Embedding row for each id: [n_ids, hidden_size], row-major.
+    std::vector<float> embed_ids(const std::vector<int>& ids) const;
+
+    // Prefill: embeds the ids, runs them through every layer with the
+    // persistent KV cache, and returns logits [vocab_size] for the LAST id.
+    // The cache is reset first, so this is the start of a sequence.
+    std::vector<float> prefill(const std::vector<int>& ids);
+
+    // Decode one token: embeds `token_id`, appends its K/V to the persistent
+    // cache, returns logits [vocab_size]. Use after prefill().
+    std::vector<float> step(int token_id);
+
     // Runs a SINGLE hidden state through all layers, attending to the
     // PERSISTENT KV cache (appends this token's K/V to the cache). Returns
     // logits [vocab_size] for this token. Use for autoregressive decode.
@@ -103,6 +128,13 @@ public:
 
     // Number of parameters (approx, from loaded tensors).
     size_t param_count() const { return param_count_; }
+
+    // Shape accessors — a server needs these to validate a request against the
+    // model it actually loaded, rather than against a hardcoded guess.
+    int hidden_size() const { return cfg_.hidden_size; }
+    int vocab_size() const { return cfg_.vocab_size; }
+    int max_context() const { return cfg_.max_position_embeddings; }
+    const ModelConfig& config() const { return cfg_; }
 
     // ── GPU projections (OpenCL) ──────────────────────────────────────────
     // When enabled, the four attention projections of every layer (Q, K, V, O)

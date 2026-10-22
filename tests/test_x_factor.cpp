@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 using winnex_nano::XFactor;
@@ -84,12 +85,37 @@ int main() {
     // 4. expand_spectral produces a D-dim unit vector.
     std::vector<float> psi(8, 0.0f), expD(D);
     for (int j = 0; j < 8; ++j) psi[j] = (j % 2 ? 1.0f : -0.5f);
-    winnex_nano::expand_spectral(psi.data(), 8, expD.data(), D);
+    winnex_nano::expand_spectral(psi.data(), 8, 8, expD.data(), D);
     float nn = 0;
     for (int j = 0; j < D; ++j) nn += expD[j]*expD[j];
     bool ok4 = (std::fabs(std::sqrt(nn) - 1.0f) < 1e-3);
     printf("expand_spectral unit norm: %s\n", ok4 ? "OK" : "FAIL");
     if (!ok4) ++failures;
+
+    // 4b. Asking for more elements than the buffer holds must THROW, not read
+    // past it. Before psi_len existed this call returned NaNs (measured 896 of
+    // 896 on a 256-float histogram) and the caller could not tell.
+    bool ok4b = false;
+    try {
+        std::vector<float> short_psi(8, 0.5f), exp2(D);
+        winnex_nano::expand_spectral(short_psi.data(), 8, 64, exp2.data(), D);
+    } catch (const std::invalid_argument&) {
+        ok4b = true;
+    }
+    printf("expand_spectral rejects d > psi_len: %s\n", ok4b ? "OK" : "FAIL");
+    if (!ok4b) ++failures;
+
+    // 4c. An all-zero source has no direction. That is an error, not a
+    // division by 1e-9 that yields 1e9-scale garbage.
+    bool ok4c = false;
+    try {
+        std::vector<float> zeros(8, 0.0f), exp3(D);
+        winnex_nano::expand_spectral(zeros.data(), 8, 8, exp3.data(), D);
+    } catch (const std::invalid_argument&) {
+        ok4c = true;
+    }
+    printf("expand_spectral rejects all-zero psi: %s\n", ok4c ? "OK" : "FAIL");
+    if (!ok4c) ++failures;
 
     if (failures == 0) {
         printf("\nALL X-FACTOR TESTS PASSED\n");

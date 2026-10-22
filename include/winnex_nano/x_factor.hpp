@@ -76,8 +76,25 @@ private:
 /**
  * expand_spectral — expands a d-dim spectral token to D-dim with zero-pad +
  * L2 normalization (step 8 of the X-factor math).
+ *
+ * THROWS std::invalid_argument when d exceeds psi_len, or when any argument is
+ * negative, or when the source is all zeros (a unit vector cannot be produced).
+ *
+ * psi_len is the ACTUAL number of elements readable at `psi`, kept separate
+ * from d on purpose: callers legitimately pass a tokenizer output of one length
+ * and ask for a different prefix. Without it the function cannot tell a short
+ * read from a wrong argument, and the old signature silently read past the end
+ * of the buffer:
+ *
+ *     psi = tokenizer.encode_histogram(text)   # 256 floats
+ *     expand_spectral(psi, d=896, out, 896)    # read 640 floats of garbage
+ *
+ * Measured on exactly that call: all 896 outputs came back NaN, and the NaN
+ * then propagated into sampling as `prob = nan` with nothing raised. The caller
+ * cannot recover from that — no field in the result says the input was short.
+ * Failing loudly is the only correct behaviour.
  */
-void expand_spectral(const float* psi, int d, float* out, int D);
+void expand_spectral(const float* psi, int psi_len, int d, float* out, int D);
 
 } // namespace winnex_nano
 
