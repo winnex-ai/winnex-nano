@@ -112,7 +112,12 @@ Safetensors::Safetensors(const std::string& path) {
 }
 
 // The header parse, factored out so the copy mode and the view mode share it.
-void Safetensors::parse_header(const std::string& header) {
+void Safetensors::add_shard(const uint8_t* data, size_t len, const std::string& header_json) {
+    shards_.push_back({data, len});
+    parse_header(header_json, (int)shards_.size());   // shard 0 is the primary
+}
+
+void Safetensors::parse_header(const std::string& header, int shard) {
     size_t p = 0;
     while (p < header.size() && header[p] != '{') p++;
     p++;
@@ -188,7 +193,11 @@ void Safetensors::parse_header(const std::string& header) {
         t.shape = parse_array(find_field("shape"));
         auto offs = parse_array(find_field("data_offsets"));
         if (offs.size() >= 2) t.data_offsets = {offs[0], offs[1]};
-        tensors_[name] = t;
+        t.shard = shard;
+        // First shard to declare a name wins. Checkpoints sharded by the hub
+        // never duplicate a tensor, but a silently overwritten entry would be
+        // a very confusing failure to debug, so this keeps it deterministic.
+        if (tensors_.count(name) == 0) tensors_[name] = t;
         if (p < header.size() && header[p] == ',') p++;
     }
 }
@@ -263,7 +272,7 @@ std::vector<float> Safetensors::to_float(const SafeTensor& t) const {
     for (auto s : t.shape) n *= (size_t)s;
     std::vector<float> out(n);
     size_t bytes_per = (t.dtype == TensorDtype::F32) ? 4 : 2;
-    const uint8_t* base = data_ptr_ + (size_t)t.data_offsets[0];
+    const uint8_t* base = shard_data(t.shard) + (size_t)t.data_offsets[0];
     if (t.dtype == TensorDtype::F32) {
         std::memcpy(out.data(), base, n * 4);
     } else if (t.dtype == TensorDtype::F16) {
@@ -286,7 +295,7 @@ std::vector<int32_t> Safetensors::to_int32(const SafeTensor& t) const {
     size_t n = 1;
     for (auto s : t.shape) n *= (size_t)s;
     std::vector<int32_t> out(n);
-    const uint8_t* base = data_ptr_ + (size_t)t.data_offsets[0];
+    const uint8_t* base = shard_data(t.shard) + (size_t)t.data_offsets[0];
     if (t.dtype == TensorDtype::I32) {
         std::memcpy(out.data(), base, n * 4);
     } else {
@@ -311,7 +320,7 @@ std::vector<float> Safetensors::read_rows(const SafeTensor& t, int row_start, in
         throw std::runtime_error("read_rows: out of range");
 
     std::vector<float> out((size_t)n_rows * cols);
-    const uint8_t* base = data_ptr_ + (size_t)t.data_offsets[0];
+    const uint8_t* base = shard_data(t.shard) + (size_t)t.data_offsets[0];
     const size_t row_bytes = (t.dtype == TensorDtype::F32) ? (size_t)cols * 4
                                                            : (size_t)cols * 2;
     for (int r = 0; r < n_rows; ++r) {

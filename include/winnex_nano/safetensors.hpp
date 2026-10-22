@@ -37,6 +37,8 @@ struct SafeTensor {
     TensorDtype dtype = TensorDtype::Unknown;
     std::vector<int64_t> shape;
     std::vector<int64_t> data_offsets;  // [begin, end) into the shared data blob
+    // Which shard's payload data_offsets index into. 0 for a single file.
+    int shard = 0;
 };
 
 // Immutable view over a .safetensors file.
@@ -75,6 +77,21 @@ public:
     // Use this to learn the payload offset before mapping it on the caller side.
     static std::string read_header(const std::string& path, uint64_t* payload_offset);
 
+    // Adds another shard to this view. `data`/`len` are that shard's payload
+    // bytes, borrowed exactly like view(). Tensor names must not collide.
+    //
+    // Why: hub checkpoints ship as model-00001-of-0000N.safetensors and the
+    // index (model.safetensors.index.json) maps each tensor to its shard.
+    // Refusing to open those meant every caller had to concatenate 15 GB of
+    // files before the engine would run — the Kaggle notebook among them.
+    void add_shard(const uint8_t* data, size_t len, const std::string& header_json);
+
+    // Payload base of one shard (0 when there is only the primary payload).
+    const uint8_t* shard_data(int shard) const {
+        return shard == 0 ? data_ptr_ : shards_[(size_t)shard - 1].ptr;
+    }
+    int shard_count() const { return 1 + (int)shards_.size(); }
+
     bool has(const std::string& name) const { return tensors_.count(name) > 0; }
     const SafeTensor& get(const SafeTensor& t) const { return t; }
     const SafeTensor& get(const std::string& name) const;
@@ -97,10 +114,12 @@ public:
     std::vector<float> read_rows(const SafeTensor& t, int row_start, int n_rows) const;
 
 private:
-    void parse_header(const std::string& header);
+    void parse_header(const std::string& header, int shard = 0);
     std::vector<uint8_t> owned_;      // empty in view mode
     const uint8_t* data_ptr_ = nullptr;
     size_t data_size_ = 0;
+    struct ShardRef { const uint8_t* ptr; size_t len; };
+    std::vector<ShardRef> shards_;    // shards 1..N-1 (0 is data_ptr_)
     std::map<std::string, SafeTensor> tensors_;
 };
 

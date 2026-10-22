@@ -15,6 +15,8 @@
 #include <pybind11/stl.h>
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
+#include <filesystem>
+#include <algorithm>
 #include <cstring>
 #include <random>
 
@@ -245,7 +247,60 @@ PYBIND11_MODULE(_winnex_nano, m) {
             std::string h = Safetensors::read_header(path, &off);
             return py::make_tuple(h, (long long)off);
         }, py::arg("path"),
-           "Read only the header JSON (+ payload offset), leaving the payload on disk");
+           "Read only the header JSON (+ payload offset), leaving the payload on disk")
+        // Load a directory of shards without copying or concatenating.
+        //
+        // Hub checkpoints ship as model-00001-of-0000N.safetensors. Every
+        // caller used to have to merge them into one 15 GB file first — which
+        // is what the Kaggle notebook was doing, with 10 GB of disk to spare.
+        // This opens each shard, records the tensors it owns, and keeps every
+        // page on disk: peak memory is the mmaps' working set, not the model.
+        .def_static("open_dir", [](const std::string& dir) {
+            namespace fs = std::filesystem;
+            std::vector<fs::path> files;
+            for (auto& e : fs::directory_iterator(dir)) {
+                if (e.path().extension() == ".safetensors") files.push_back(e.path());
+            }
+            if (files.empty())
+                throw std::runtime_error("Safetensors.open_dir: no .safetensors in " + dir);
+            std::sort(files.begin(), files.end());   // 00001, 00002, ... deterministic
+
+            py::object np = py::module_::import("numpy");
+            py::list owners;
+            py::object st;
+            for (size_t i = 0; i < files.size(); ++i) {
+                uint64_t off = 0;
+                std::string h = Safetensors::read_header(files[i].string(), &off);
+                const size_t len = (size_t)fs::file_size(files[i]) - (size_t)off;
+                // offset and shape MUST be keyword arguments: positionally the
+                // 4th parameter of np.memmap is `offset` only if written as
+                // np.memmap(f, dtype, mode, off) — with a 5th positional it is
+                // read as shape, and an earlier version here passed the offset
+                // as the shape, mapping 20 KB instead of the 3.9 GB payload.
+                // Every read past the header then hit unmapped pages (SIGSEGV).
+                py::object mm = np.attr("memmap")(
+                    py::arg("filename") = files[i].string(),
+                    py::arg("dtype") = "uint8",
+                    py::arg("mode") = "r",
+                    py::arg("offset") = (long long)off,
+                    py::arg("shape") = (long long)len);
+                // The memmap stays on disk; copying here would put the whole
+                // model back in RAM one shard at a time.
+                const long long ptr =
+                    mm.attr("ctypes").attr("data").cast<long long>();
+                if (i == 0) st = py::cast(Safetensors::view((const uint8_t*)ptr, len, h));
+                else        st.attr("add_shard")(ptr, len, h);
+                owners.append(mm);
+            }
+            st.attr("_owner") = owners;   // every mmap stays alive with the view
+            return st;
+        }, py::arg("dir"),
+           "Open every .safetensors in a directory as one view (sharded checkpoints)")
+        .def("add_shard", [](Safetensors& st, long long ptr, size_t len,
+                             const std::string& header) {
+            st.add_shard((const uint8_t*)ptr, len, header);
+        }, py::arg("data_ptr"), py::arg("len"), py::arg("header_json"))
+        .def_property_readonly("shard_count", &Safetensors::shard_count);
 
     // --- ModelConfig + load_config -----------------------------------------
     py::class_<ModelConfig>(m, "ModelConfig")
