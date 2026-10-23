@@ -1,5 +1,5 @@
-// stream_engine.cpp — Winnex-Nano streaming engine (chunk via fast build).
-#include "winnex_nano/stream_engine.hpp"
+// chunk_engine.cpp — Winnex-Nano streaming engine (chunk via fast build).
+#include "winnex_nano/chunk_engine.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -22,7 +22,7 @@ namespace {
 // for every character and every mode, the average is 1.0, and after
 // normalisation the result is the CONSTANT vector 1/sqrt(embed_dim) for ANY
 // text. Measured: cos("quantum physics", "banana bread recipe") = 1.000000,
-// and cos("abc","cba") = 1.000000. The StreamEngine was indexing N identical
+// and cos("abc","cba") = 1.000000. The ChunkEngine was indexing N identical
 // vectors, so retrieval returned an arbitrary member of a tie.
 //
 // The information lives in the PHASE and in the ORDER of the characters.
@@ -53,13 +53,13 @@ std::vector<float> text_to_vector(const std::string& text,
 }
 } // namespace
 
-StreamEngine::StreamEngine()
+ChunkEngine::ChunkEngine()
     : opts_(), tokenizer_(opts_.embed_dim) {}
 
-StreamEngine::StreamEngine(const Options& opts)
+ChunkEngine::ChunkEngine(const Options& opts)
     : opts_(opts), tokenizer_(opts.embed_dim) {}
 
-std::string StreamEngine::stream(
+std::string ChunkEngine::generate_chunks(
     const std::string& prompt,
     const std::function<std::string(const std::string&, const std::vector<std::string>&)>& next_chunk_fn,
     const ChunkSink& sink) {
@@ -144,7 +144,7 @@ std::string StreamEngine::stream(
         if (chunk.empty()) break; // EOS
 
         // 4. Emit the chunk (SSE) and add it to the working memory.
-        StreamChunk sc;
+        Chunk sc;
         sc.text = chunk;
         sc.done = false;
         sc.build_ms = build_ms;
@@ -164,7 +164,7 @@ std::string StreamEngine::stream(
 
     // Emit the final done chunk.
     if (sink) {
-        StreamChunk sc;
+        Chunk sc;
         sc.text = "";
         sc.done = true;
         sink(sc);

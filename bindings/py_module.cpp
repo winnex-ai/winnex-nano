@@ -5,7 +5,7 @@
 // forward pass. No CUDA — OpenCL/AVX2/OpenMP backends.
 #include "winnex_nano/spectral_tokenizer.hpp"
 #include "winnex_nano/weight_balancer.hpp"
-#include "winnex_nano/stream_engine.hpp"
+#include "winnex_nano/chunk_engine.hpp"
 #include "winnex_nano/x_factor.hpp"
 #include "winnex_nano/embed_bridge.hpp"
 #include "winnex_nano/safetensors.hpp"
@@ -224,25 +224,28 @@ PYBIND11_MODULE(_winnex_nano, m) {
         .def("blend_with_rotation", &WeightBalancer::blend_with_rotation,
              py::arg("models"), py::arg("weights"));
 
-    py::class_<StreamChunk>(m, "StreamChunk")
+    py::class_<Chunk>(m, "Chunk")
         .def(py::init<>())
-        .def_readwrite("text", &StreamChunk::text)
-        .def_readwrite("done", &StreamChunk::done)
-        .def_readwrite("doc_id", &StreamChunk::doc_id)
-        .def_readwrite("build_ms", &StreamChunk::build_ms)
-        .def_readwrite("search_ms", &StreamChunk::search_ms);
+        .def_readwrite("text", &Chunk::text)
+        .def_readwrite("done", &Chunk::done)
+        .def_readwrite("doc_id", &Chunk::doc_id)
+        .def_readwrite("build_ms", &Chunk::build_ms)
+        .def_readwrite("search_ms", &Chunk::search_ms);
 
-    py::class_<StreamEngine>(m, "StreamEngine")
+    py::class_<ChunkEngine>(m, "ChunkEngine")
         .def(py::init<>())
-        .def(py::init<const StreamEngine::Options&>(), py::arg("opts"))
-        .def("stream", &StreamEngine::stream, py::arg("prompt"),
+        .def(py::init<const ChunkEngine::Options&>(), py::arg("opts"))
+        // Alias depreciado: `stream` não descreve o que o método faz.
+        .def("stream", &ChunkEngine::generate_chunks,
+             "DEPRECIADO — use generate_chunks(). Não faz stream de pesos.")
+        .def("generate_chunks", &ChunkEngine::generate_chunks, py::arg("prompt"),
              py::arg("next_chunk_fn"), py::arg("sink"));
 
-    py::class_<StreamEngine::Options>(m, "StreamOptions")
+    py::class_<ChunkEngine::Options>(m, "ChunkOptions")
         .def(py::init<>())
-        .def_readwrite("embed_dim", &StreamEngine::Options::embed_dim)
-        .def_readwrite("top_k", &StreamEngine::Options::top_k)
-        .def_readwrite("build_interval", &StreamEngine::Options::build_interval);
+        .def_readwrite("embed_dim", &ChunkEngine::Options::embed_dim)
+        .def_readwrite("top_k", &ChunkEngine::Options::top_k)
+        .def_readwrite("build_interval", &ChunkEngine::Options::build_interval);
 
     // NOTE: the XFactor class is exposed via the free function
     // `compute_xfactor` (returns the projector as numpy arrays) instead of a
@@ -653,4 +656,13 @@ PYBIND11_MODULE(_winnex_nano, m) {
                  (const float*)w.request().ptr, n, d, eps);
         return y;
     }, py::arg("x"), py::arg("w"), py::arg("n"), py::arg("d"), py::arg("eps"));
+
+    // Alias DEPRECIADO no nível do módulo, para não quebrar código existente.
+    // `StreamEngine` descrevia a coisa errada: em inferência, "stream" significa
+    // carregar pesos em fluxo para rodar um modelo maior que a memória, e esta
+    // classe nunca fez isso. O alias some na 0.2.
+    m.attr("StreamEngine") = m.attr("ChunkEngine");
+    m.attr("StreamOptions") = m.attr("ChunkOptions");
+    m.attr("StreamChunk") = m.attr("Chunk");
+
 }

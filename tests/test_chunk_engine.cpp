@@ -1,6 +1,6 @@
-// test_stream.cpp — validates the Winnex-Nano streaming engine: the chunk
+// test_chunk_engine.cpp — validates the Winnex-Nano streaming engine: the chunk
 // generation loop using the Madhava fast build as incremental working memory.
-#include "winnex_nano/stream_engine.hpp"
+#include "winnex_nano/chunk_engine.hpp"
 #include "winnex_nano/spectral_tokenizer.hpp"
 
 #include <chrono>
@@ -9,17 +9,17 @@
 #include <string>
 #include <vector>
 
-using winnex_nano::StreamEngine;
+using winnex_nano::ChunkEngine;
 
 int main() {
     int failures = 0;
 
-    StreamEngine engine(StreamEngine::Options{64, 3, 0});
+    ChunkEngine engine(ChunkEngine::Options{64, 3, 0});
     std::vector<std::string> emitted;
     double total_build_ms = 0;
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    std::string output = engine.stream(
+    std::string output = engine.generate_chunks(
         "O Madhava e um motor de busca vetorial deterministica.",
         // Generation policy: emit 3 fixed chunks, then EOS.
         [](const std::string& ctx, const std::vector<std::string>& top) {
@@ -33,7 +33,7 @@ int main() {
             if (step < 3) return std::string(chunks[step++]);
             return std::string(); // EOS
         },
-        [&](const winnex_nano::StreamChunk& c) {
+        [&](const winnex_nano::Chunk& c) {
             if (c.done) return;
             emitted.push_back(c.text);
             total_build_ms += c.build_ms;

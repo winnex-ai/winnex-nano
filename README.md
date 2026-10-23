@@ -1,6 +1,6 @@
 # winnex-nano
 
-**Native Winnex inference engine — deterministic spectral tokenizer, multimodel weight balancing, and chunk streaming via the Madhava fast build.**
+**Native Winnex inference engine — deterministic spectral tokenizer, multimodel weight balancing, and chunk generation via the Madhava fast build.**
 
 Model-agnostic (Qwen / BERT / DeepSeek / GPT), C++20/OpenCL, no CUDA. Reuses the
 [winnex-madhava](https://pypi.org/project/winnex-madhava/) engine kernels (QKᵀ matmul,
@@ -12,7 +12,7 @@ selective-top-K with Cauchy-Schwarz bounds) — no code duplication.
 |--------|---------|
 | `SpectralTokenizer` | Character → quaternion spectrum (deterministic, no BPE, no vocabulary) |
 | `WeightBalancer` | Multimodel fusion: `W' = Σᵢ αᵢ·R(qᵢ)·Wᵢ` |
-| `StreamEngine` | Chunk generation via the Madhava fast build (working memory) |
+| `ChunkEngine` | Geração por chunks com memória de trabalho Madhava — **não** faz stream de pesos |
 | `server_sse` | OpenAI-compatible `/v1/chat/completions` (stream + non-stream) |
 
 ## Installation
@@ -42,15 +42,27 @@ a = wn.BlendWeight(); a.alpha = 0.5
 b = wn.BlendWeight(); b.alpha = 0.5
 fused = bal.blend([model_a, model_b], [a, b])   # [5.5, 11, 16.5, 22]
 
-# 3. Streaming via the Madhava fast build
-engine = wn.StreamEngine()
+# 3. ChunkEngine — geração por chunks com memória de trabalho Madhava
+#
+# ATENÇÃO AO ESCOPO: isto NÃO faz streaming de pesos. A decisão do próximo
+# chunk é uma função que você fornece; a classe não carrega modelo nenhum.
+# Para inferência de verdade, use ForwardEngine (prefill/step), abaixo.
+engine = wn.ChunkEngine()
 chunks = []
-engine.stream(
+engine.generate_chunks(
     "O Madhava e deterministico.",
     lambda ctx, top: " chunk" if len(chunks) < 3 else "",
     lambda c: chunks.append(c.text) if not c.done else None,
 )
 ```
+
+> **Sobre o nome.** Esta classe se chamava `StreamEngine` até a 0.1.33. O nome
+> estava errado: em inferência, "stream" quer dizer carregar pesos em fluxo para
+> rodar um modelo maior que a memória, e esta classe nunca fez isso. O alias
+> `StreamEngine` e o método `.stream()` continuam funcionando, mas estão
+> depreciados e somem na 0.2. O modo de pesos que faz streaming real por camada
+> é `ForwardEngine::weight_mode() == "stream"` — e ele é **mais lento que a CPU**
+> quando o modelo não cabe no device (medido: 90,8 s contra 67,0 s no 7B).
 
 ## Server (OpenAI-compatible, real inference)
 

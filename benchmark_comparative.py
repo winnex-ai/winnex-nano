@@ -4,7 +4,7 @@ Honest comparative benchmark — winnex-nano vs alternatives.
 
 Compares on REAL metrics, no cherry-picking:
   A. Tokenization: winnex-nano spectral vs BPE (transformers/Qwen2.5)
-  B. Streaming: winnex-nano StreamEngine vs SGLang (if available)
+  B. Streaming: winnex-nano ChunkEngine vs SGLang (if available)
   C. WeightBalancer: weight fusion (correctness + speed)
 
 Honesty note:
@@ -91,7 +91,7 @@ def bench_bpe():
 def bench_stream():
     r = {}
     for n in (10, 50, 100):
-        engine = wn.StreamEngine()
+        engine = wn.ChunkEngine()
         chunks = []
         t0 = time.perf_counter()
         def next_chunk(ctx, top):

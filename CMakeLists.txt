@@ -87,7 +87,7 @@ add_library(winnex_nano
     src/spectral_tokenizer.cpp
     src/weight_balancer.cpp
     src/tensor_ops.cpp
-    src/stream_engine.cpp
+    src/chunk_engine.cpp
     src/x_factor.cpp
     # A ponte entre a codificação sem vocabulário e o espaço de embeddings.
     # Ver o cabeçalho para o motivo medido (top-1 errado em 4/4 prompts).
@@ -137,9 +137,9 @@ if(WINNEX_NANO_BUILD_TESTS)
     target_link_libraries(test_hrr PRIVATE winnex_nano)
     add_test(NAME hrr COMMAND test_hrr)
 
-    add_executable(test_stream tests/test_stream.cpp)
-    target_link_libraries(test_stream PRIVATE winnex_nano)
-    add_test(NAME stream COMMAND test_stream)
+    add_executable(test_chunk_engine tests/test_chunk_engine.cpp)
+    target_link_libraries(test_chunk_engine PRIVATE winnex_nano)
+    add_test(NAME chunk_engine COMMAND test_chunk_engine)
 
     add_executable(test_x_factor tests/test_x_factor.cpp)
     target_link_libraries(test_x_factor PRIVATE winnex_nano)

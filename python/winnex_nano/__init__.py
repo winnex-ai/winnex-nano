@@ -16,7 +16,7 @@ Components:
                          GQA attention, SiLU MLP, lm_head)
     - sample_embeddings: read N rows of a tensor without materializing it
     - WeightBalancer:    W' = Σᵢ αᵢ·R(qᵢ)·Wᵢ  (multimodel fusion)
-    - StreamEngine:      chunk generation via Madhava fast build (SSE)
+    - ChunkEngine:      chunk generation via Madhava fast build (SSE)
 
 The inference path (X-Factor + forward, no BPE):
     text → SpectralTokenizer.encode_histogram → expand_spectral(D)
@@ -30,6 +30,9 @@ from ._winnex_nano import (
     SpectralTokenizer,
     WeightBalancer,
     BlendWeight,
+    ChunkEngine,
+    ChunkOptions,
+    Chunk,
     StreamEngine,
     StreamOptions,
     StreamChunk,
@@ -71,9 +74,14 @@ __all__ = [
     "SpectralTokenizer",
     "WeightBalancer",
     "BlendWeight",
+    "ChunkEngine",
+    # Aliases DEPRECIADOS (rename 0.1.33): `StreamEngine` descrevia a coisa
+    # errada — não faz stream de pesos. Somem na 0.2.
     "StreamEngine",
     "StreamOptions",
     "StreamChunk",
+    "ChunkOptions",
+    "Chunk",
     "Safetensors",
     "ModelConfig",
     "ForwardEngine",
