@@ -473,6 +473,25 @@ PYBIND11_MODULE(_winnex_nano, m) {
         // Bytes of projection weights living on the device in "device" mode.
         // Diagnostic: it is the number that decides whether the model fits.
         .def_property_readonly("device_weight_bytes", &ForwardEngine::device_weight_bytes)
+        // Diagnóstico: o kernel de atenção compilou? Sem isso, "a atenção
+        // está na GPU" é afirmação sem verificação.
+        .def_property_readonly("attention_on_gpu", [](const ForwardEngine& e) {
+            return e.gpu_attention(); })
+        // Teste direto do kernel de atenção, sem passar pelo forward: isola
+        // um defeito de kernel de um defeito no caminho do modelo.
+        .def("attention_raw", [](ForwardEngine& e,
+                                 py::array_t<float, py::array::c_style | py::array::forcecast> Q,
+                                 py::array_t<float, py::array::c_style | py::array::forcecast> K,
+                                 py::array_t<float, py::array::c_style | py::array::forcecast> V,
+                                 int seq, int nh, int nkv, int hd) {
+            py::array_t<float> O(std::vector<py::ssize_t>{seq, nh, hd});
+            e.attention_raw((const float*)Q.request().ptr, (const float*)K.request().ptr,
+                            (const float*)V.request().ptr, O.mutable_data(),
+                            seq, seq, nh, nkv, hd, 0);
+            return O;
+        }, py::arg("Q"), py::arg("K"), py::arg("V"),
+           py::arg("seq"), py::arg("nh"), py::arg("nkv"), py::arg("hd"))
+        .def_property_readonly("gpu_refusal", &ForwardEngine::gpu_refusal)
         .def_property_readonly("resident_bytes", &ForwardEngine::estimate_resident_bytes)
         .def_static("available_ram_bytes", &ForwardEngine::available_ram_bytes);
 

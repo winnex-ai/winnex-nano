@@ -80,6 +80,20 @@ public:
     /** True when `tag` is resident on the device. */
     bool has_weight(const char* tag) const;
 
+    /**
+     * Self-attention causal completa no device.
+     *
+     *   O[t,h,:] = Σ_{u≤cache_pos+t} softmax(u; Q[t,h]·K[u,kvh]) · V[u,kvh,:]
+     *
+     * Q [seq, nh, hd], K/V [ctx, nkv, hd], O [seq, nh, hd]. Faz o softmax
+     * exato — não top-k — porque é a função com que os pesos foram treinados.
+     */
+    void attention(const float* Q, const float* K, const float* V, float* O,
+                   int seq, int ctx, int nh, int nkv, int hd, int cache_pos);
+
+    /** True quando o kernel de atenção compilou. */
+    bool has_attention() const;
+
     /** Device memory total and free, in bytes (0 when the driver will not say). */
     size_t device_memory_total() const;
     size_t device_memory_free() const;

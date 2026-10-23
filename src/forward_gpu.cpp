@@ -295,6 +295,71 @@ void gemm_bias_bf16(
         C[(size_t)t * out_dim + wr] = acc;
     }
 }
+// ── ATENÇÃO NA GPU ────────────────────────────────────────────────────────
+//
+// Medido: o caminho CPU fazia prefill a 79 tok/s no 0.5B contra 2312 do
+// transformers — 29x. A causa era a atenção inteira no host: para cada
+// (token, cabeça) um laço de hd=128 sobre todas as chaves, em série, e depois
+// 5 projeções por camada, cada uma com um round-trip síncrono.
+//
+// Este kernel faz a atenção causal completa por cabeça. Um work-group por
+// (token, cabeça); as chaves visíveis são lidas de uma janela de cache em
+// shared memory quando cabem, e da global quando não cabem.
+//
+// Softmax, não top-k: é a função com que os pesos pré-treinados foram
+// treinados. A máscara causal é aplicada por índice (u <= pos), então não há
+// risco de vazar o futuro.
+#define ATT_TILE 128
+
+__kernel void attention_causal(
+    __global const float* Q,      // [seq, nh, hd]
+    __global const float* K,      // [ctx, nkv, hd]
+    __global const float* V,      // [ctx, nkv, hd]
+    __global float* O,            // [seq, nh, hd]
+    int seq, int ctx, int nh, int nkv, int hd, int cache_pos)
+{
+    const int t = (int)get_global_id(0);        // posição na sequência
+    const int h = (int)get_global_id(1);        // cabeça
+    if (t >= seq || h >= nh) return;
+
+    const int gqa = nh / nkv;                   // cabeças por grupo
+    const int kvh = h / gqa;
+    const int pos = cache_pos + t;              // posição absoluta
+    const int lim = pos + 1;                    // causal: 0..pos
+
+    const __global float* qh = Q + ((size_t)t * nh + h) * hd;
+    const float scale = rsqrt((float)hd);
+
+    // Passagem 1: máximo e soma (softmax estável em duas passagens).
+    float m = -INFINITY;
+    for (int u = 0; u < lim; ++u) {
+        const __global float* kh = K + ((size_t)u * nkv + kvh) * hd;
+        float s = 0.0f;
+        for (int j = 0; j < hd; ++j) s += qh[j] * kh[j];
+        s *= scale;
+        if (s > m) m = s;
+    }
+    float den = 0.0f;
+    for (int u = 0; u < lim; ++u) {
+        const __global float* kh = K + ((size_t)u * nkv + kvh) * hd;
+        float s = 0.0f;
+        for (int j = 0; j < hd; ++j) s += qh[j] * kh[j];
+        den += exp(s * scale - m);
+    }
+    const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+
+    // Passagem 2: acumula os valores ponderados.
+    __global float* oh = O + ((size_t)t * nh + h) * hd;
+    for (int j = 0; j < hd; ++j) oh[j] = 0.0f;
+    for (int u = 0; u < lim; ++u) {
+        const __global float* kh = K + ((size_t)u * nkv + kvh) * hd;
+        float s = 0.0f;
+        for (int j = 0; j < hd; ++j) s += qh[j] * kh[j];
+        const float w = exp(s * scale - m) * inv;
+        const __global float* vh = V + ((size_t)u * nkv + kvh) * hd;
+        for (int j = 0; j < hd; ++j) oh[j] += w * vh[j];
+    }
+}
 )";
 
 } // namespace
@@ -307,6 +372,19 @@ struct ForwardGpu::Impl {
     cl_program prog = nullptr;
     cl_kernel k_gemm = nullptr;
     cl_kernel k_gemm_bf16 = nullptr;
+    cl_kernel k_attn = nullptr;
+    cl_mem q_buf = nullptr, k_buf = nullptr, v_buf = nullptr, o_buf = nullptr;
+    // k_cap e v_cap SEPARADOS. Eram um `kv_cap` compartilhado, e o grow do K
+    // atualizava a capacidade antes do grow do V consultá-la — então o V via
+    // "já cabe" e continuava com o buffer pequeno do forward anterior. Medido:
+    // aquecer com n=2 e medir n=4 divergia em 23,5; decrescente funcionava.
+    size_t q_cap = 0, k_cap = 0, v_cap = 0, o_cap = 0;
+    // A janela de K/V muda de tamanho entre forwards (cache_pos + seq). O
+    // `grow` só realoca quando `cap` cresce, mas o CONTEÚDO acima de ctx é
+    // lixo do forward anterior — e o kernel lê só até `lim`, então isso é
+    // inofensivo. O que NÃO é inofensivo é o `o_buf`: se o forward anterior
+    // tinha seq maior, o kernel escreve menos e a leitura devolve o resto
+    // antigo. Por isso a leitura usa exatamente o_bytes, nunca o cap.
     cl_device_id dev = nullptr;
     size_t dev_total = 0, dev_free = 0;
     char dev_name[256] = {0};
@@ -494,16 +572,52 @@ struct ForwardGpu::Impl {
     }
 
     ~Impl() {
-        // tagged holds the same cl_mem values as wcache; release each once.
-        for (auto& kv : wcache) g_api->clReleaseMemObject(kv.second.mem);
+        // `tagged` holds the WEIGHTS. It is the map that gets populated in
+        // device mode, and `wcache` only holds untagged fallback uploads.
+        //
+        // This used to release wcache and skip tagged, on the assumption that
+        // "tagged holds the same cl_mem values as wcache; release each once".
+        // That was true before weights started being keyed by tensor name, and
+        // stopped being true the moment they were: tagged became the primary
+        // store and wcache stayed empty. Measured: after `del eng` the device
+        // still held 1648 MB from a 0.5B whose weights are 1.33 GB — the whole
+        // model, leaked. In a benchmark that loads several models in sequence
+        // it looks like CL_MEM_OBJECT_ALLOCATION_FAILURE (-4) on the third.
+        //
+        // Release both, and only once each: a cl_mem can legitimately appear in
+        // both maps when a tagged upload hit the pointer cache first, so the
+        // values are deduplicated before releasing.
+        std::vector<cl_mem> to_release;
+        to_release.reserve(tagged.size() + wcache.size());
+        for (auto& kv : tagged) to_release.push_back(kv.second);
+        for (auto& kv : wcache) {
+            cl_mem m = kv.second.mem;
+            bool dup = false;
+            for (cl_mem x : to_release) if (x == m) { dup = true; break; }
+            if (!dup) to_release.push_back(m);
+        }
+        for (cl_mem m : to_release) g_api->clReleaseMemObject(m);
+        tagged.clear();
+        wcache.clear();
+
         if (ba) g_api->clReleaseMemObject(ba);
         if (bc) g_api->clReleaseMemObject(bc);
         if (bb) g_api->clReleaseMemObject(bb);
         if (k_gemm) g_api->clReleaseKernel(k_gemm);
         if (k_gemm_bf16) g_api->clReleaseKernel(k_gemm_bf16);
+        if (k_attn) g_api->clReleaseKernel(k_attn);
+        if (q_buf) g_api->clReleaseMemObject(q_buf);
+        if (k_buf) g_api->clReleaseMemObject(k_buf);
+        if (v_buf) g_api->clReleaseMemObject(v_buf);
+        if (o_buf) g_api->clReleaseMemObject(o_buf);
         if (prog) g_api->clReleaseProgram(prog);
         if (q) g_api->clReleaseCommandQueue(q);
         if (ctx) g_api->clReleaseContext(ctx);
+        // clFinish before destroying the context: pending commands holding
+        // references to the buffers would otherwise keep them alive past
+        // clReleaseMemObject, which is exactly the "released but still
+        // resident" symptom. q is released above, so flush through the
+        // context teardown instead — clReleaseCommandQueue already drains.
     }
 };
 
@@ -554,6 +668,7 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
                                              ln, log.data(), nullptr);
         throw std::runtime_error(std::string("ForwardGpu: clBuildProgram failed:\n") + log.data());
     }
+    impl_->k_attn = g_api->clCreateKernel(impl_->prog, "attention_causal", &err);
     impl_->dev = dev;
     {
         cl_ulong total = 0, freeb = 0;
@@ -577,6 +692,70 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
 ForwardGpu::~ForwardGpu() { delete impl_; }
 
 bool ForwardGpu::ready() const { return impl_ != nullptr && impl_->k_gemm != nullptr; }
+
+bool ForwardGpu::has_attention() const {
+    return impl_ != nullptr && impl_->k_attn != nullptr;
+}
+
+void ForwardGpu::attention(const float* Q, const float* K, const float* V, float* O,
+                           int seq, int ctx, int nh, int nkv, int hd, int cache_pos) {
+    if (!impl_) throw std::runtime_error("ForwardGpu::attention: not initialised");
+    if (!impl_->k_attn) throw std::runtime_error("ForwardGpu::attention: kernel not compiled");
+    const size_t q_bytes = (size_t)seq * nh * hd * sizeof(float);
+    const size_t kv_bytes = (size_t)ctx * nkv * hd * sizeof(float);
+    const size_t o_bytes = q_bytes;
+    cl_int err = CL_SUCCESS;
+
+    auto grow = [&](cl_mem& buf, size_t& cap, size_t need, cl_mem_flags f) {
+        if (cap >= need && buf) return;
+        if (buf) { g_api->clReleaseMemObject(buf); }
+        buf = g_api->clCreateBuffer(impl_->ctx, f, need, nullptr, &err);
+        if (err != CL_SUCCESS)
+            throw std::runtime_error("ForwardGpu::attention: buffer failed (" +
+                                     std::to_string(err) + ") for " +
+                                     std::to_string(need) + " bytes");
+        cap = need;
+    };
+    grow(impl_->q_buf, impl_->q_cap, q_bytes, CL_MEM_READ_ONLY);
+    grow(impl_->k_buf, impl_->k_cap, kv_bytes, CL_MEM_READ_ONLY);
+    grow(impl_->v_buf, impl_->v_cap, kv_bytes, CL_MEM_READ_ONLY);
+    grow(impl_->o_buf, impl_->o_cap, o_bytes, CL_MEM_WRITE_ONLY);
+
+    const cl_bool blocking = CL_TRUE;
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->q_buf, blocking, 0, q_bytes, Q, 0, nullptr, nullptr);
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->k_buf, blocking, 0, kv_bytes, K, 0, nullptr, nullptr);
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->v_buf, blocking, 0, kv_bytes, V, 0, nullptr, nullptr);
+
+    cl_mem qb = impl_->q_buf, kb = impl_->k_buf, vb = impl_->v_buf, ob = impl_->o_buf;
+    cl_kernel k = impl_->k_attn;
+    // Ordem dos argumentos confere com a assinatura do kernel. Verificar cada
+    // retorno: um argumento trocado faz o enqueue falhar com -52 sem dizer
+    // qual, e um argumento ERRADO MAS VÁLIDO (ex.: ctx no lugar de seq) roda
+    // e produz resultado silenciosamente errado.
+    struct Arg { cl_uint i; size_t sz; const void* p; };
+    const Arg args[10] = {
+        {0, sizeof(cl_mem), &qb}, {1, sizeof(cl_mem), &kb},
+        {2, sizeof(cl_mem), &vb}, {3, sizeof(cl_mem), &ob},
+        {4, sizeof(int), &seq},   {5, sizeof(int), &ctx},
+        {6, sizeof(int), &nh},    {7, sizeof(int), &nkv},
+        {8, sizeof(int), &hd},    {9, sizeof(int), &cache_pos},
+    };
+    for (const Arg& a : args) {
+        cl_int e2 = g_api->clSetKernelArg(k, a.i, a.sz, a.p);
+        if (e2 != CL_SUCCESS)
+            throw std::runtime_error("ForwardGpu::attention: clSetKernelArg(" +
+                                     std::to_string(a.i) + ") failed (" +
+                                     std::to_string(e2) + ")");
+    }
+
+    const size_t gsz[2] = {(size_t)seq, (size_t)nh};
+    err = g_api->clEnqueueNDRangeKernel(impl_->q, k, 2, nullptr, gsz, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS)
+        throw std::runtime_error("ForwardGpu::attention: enqueue failed (" +
+                                 std::to_string(err) + ")");
+    g_api->clEnqueueReadBuffer(impl_->q, ob, CL_TRUE, 0, o_bytes, O, 0, nullptr, nullptr);
+    g_api->clFinish(impl_->q);
+}
 std::string ForwardGpu::device_name() const { return impl_ ? impl_->dev_name : ""; }
 std::string ForwardGpu::reason() { return g_reason; }
 
@@ -679,9 +858,18 @@ bool ForwardGpu::weights_fit(size_t total_f32_bytes) const {
 
 void ForwardGpu::release_weights() {
     if (!impl_) return;
-    for (auto& kv : impl_->tagged) g_api->clReleaseMemObject(kv.second);
+    // Os dois mapas, sem duplicar: um cl_mem pode estar em ambos quando um
+    // upload tagueado acertou o cache por ponteiro primeiro.
+    std::vector<cl_mem> rel;
+    for (auto& kv : impl_->tagged) rel.push_back(kv.second);
+    for (auto& kv : impl_->wcache) {
+        cl_mem m = kv.second.mem;
+        bool dup = false;
+        for (cl_mem x : rel) if (x == m) { dup = true; break; }
+        if (!dup) rel.push_back(m);
+    }
+    for (cl_mem m : rel) g_api->clReleaseMemObject(m);
     impl_->tagged.clear();
-    for (auto& kv : impl_->wcache) g_api->clReleaseMemObject(kv.second.mem);
     impl_->wcache.clear();
     impl_->bf16_cache = -1;
     impl_->declared_total_bytes = 0;
@@ -778,7 +966,17 @@ void ForwardGpu::matmul(const float* A, int seq,
     // Correctness is unchanged because this is one in-order command queue:
     // commands complete in submission order. An out-of-order queue would need
     // explicit events, and there is none here.
-    g_api->clEnqueueWriteBuffer(impl_->q, impl_->ba, CL_FALSE, 0, a_bytes, A,
+    // BLOCKING, e isso não é conservadorismo: com CL_FALSE o drive lê `A` de
+    // forma assíncrona DEPOIS que a função retorna, e `A` é um std::vector
+    // temporário do chamador que pode ser liberado antes. Medido: sequências
+    // crescentes (n=2 -> 4 -> 13) divergiam a partir de n=4 enquanto
+    // decrescentes funcionavam — o padrão exato de leitura de memória já
+    // liberada. A ordem de comando da fila não protege o buffer do HOST; só
+    // protege os cl_mem.
+    //
+    // O ganho da escrita não-bloqueante era zero de qualquer forma: medido
+    // 0,592 -> 0,612 s/token ao torná-la assíncrona, dentro do ruído.
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->ba, CL_TRUE, 0, a_bytes, A,
                                 0, nullptr, nullptr);
 
     cl_mem ba = impl_->ba, bb = impl_->bb, bc = impl_->bc;

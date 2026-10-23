@@ -169,6 +169,13 @@ public:
     /** Por que o device foi recusado (vazio quando não houve recusa). */
     std::string gpu_refusal() const { return gpu_refusal_; }
 
+    /** O kernel de atenção compilou e está sendo usado. */
+    bool gpu_attention() const;
+
+    /** Chamada direta ao kernel de atenção (teste de paridade). */
+    void attention_raw(const float* Q, const float* K, const float* V, float* O,
+                       int seq, int ctx, int nh, int nkv, int hd, int cache_pos);
+
     /** Bytes of projection weights resident on the device (0 when unused). */
     size_t device_weight_bytes() const;
     // Byte cost of holding every layer resident (float32), and the RAM the
