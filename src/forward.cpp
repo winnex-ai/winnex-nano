@@ -863,7 +863,11 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
     const double ram_avail = available_ram_bytes();
     const double budget = ram_avail * 0.60;
 
-    if (bytes_resident <= budget) {
+    // RESIDENT SÓ SEM GPU: com GPU os pesos vão para o device e o cache é
+    // indexado por nome, então endereço estável não serve para nada. Medido no
+    // Qwen3-4B: este bloco alocava 13,5 GB de heap anônimo que o warmup
+    // tornava inútil em seguida (14,15 GB -> 0,30 GB ao pulá-lo).
+    if (gpu_ == nullptr && bytes_resident <= budget) {
         if (!layers_resident_) {
             resident_.resize((size_t)cfg_.num_hidden_layers);
             for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
@@ -873,7 +877,7 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
             layers_resident_ = true;
         }
         weight_mode_ = "resident";
-    } else {
+    } else if (gpu_ == nullptr) {
         // Streaming: run_layer falls through to w_scratch (one layer at a time)
         // because resident_ stays empty.
         weight_mode_ = "stream";

@@ -540,6 +540,8 @@ struct ForwardGpu::Impl {
         cl_int err = CL_SUCCESS;
         cl_mem b = nullptr;
 
+        // Sem CL_MEM_COPY_HOST_PTR: o buffer é criado vazio e preenchido por
+        // clEnqueueWriteBuffer. O driver não tem motivo para pinar o host.
         if (as_bf16) {
             // Convert on the host. Halves PCIe traffic as well as device
             // footprint — the same truncation the checkpoint already carries.
@@ -552,11 +554,17 @@ struct ForwardGpu::Impl {
                 bits += 0x7fffu + ((bits >> 16) & 1u);
                 half[i] = (unsigned short)(bits >> 16);
             }
-            b = g_api->clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                      n_floats * sizeof(unsigned short), half.data(), &err);
+            b = g_api->clCreateBuffer(ctx, CL_MEM_READ_ONLY,
+                                      n_floats * sizeof(unsigned short), nullptr, &err);
+            if (err == CL_SUCCESS)
+                err = g_api->clEnqueueWriteBuffer(q, b, CL_TRUE, 0,
+                    n_floats * sizeof(unsigned short), half.data(), 0, nullptr, nullptr);
         } else {
-            b = g_api->clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                      n_floats * sizeof(float), (void*)W, &err);
+            b = g_api->clCreateBuffer(ctx, CL_MEM_READ_ONLY,
+                                      n_floats * sizeof(float), nullptr, &err);
+            if (err == CL_SUCCESS)
+                err = g_api->clEnqueueWriteBuffer(q, b, CL_TRUE, 0,
+                    n_floats * sizeof(float), (const void*)W, 0, nullptr, nullptr);
         }
         if (err != CL_SUCCESS)
             throw std::runtime_error("ForwardGpu: weight buffer failed (" +

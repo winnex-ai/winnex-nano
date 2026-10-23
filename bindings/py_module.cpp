@@ -286,9 +286,22 @@ PYBIND11_MODULE(_winnex_nano, m) {
             const auto& t = st.get(name);
             return std::vector<int64_t>(t.shape.begin(), t.shape.end());
         }, py::arg("name"))
+        // numpy array, não lista Python.
+        //
+        // `return st.to_float(...)` devolvia std::vector<float>, que o pybind11
+        // converte em py::list — UM OBJETO PYTHON POR FLOAT, 56 bytes cada.
+        // Para gate_proj do Qwen3-4B (24,9 M floats) isso é 1,19 GB de heap
+        // anônimo para uma matriz de 0,093 GB: 12,8x o necessário. Medido, e a
+        // memória some ao liberar — por isso parecia vazamento do driver
+        // OpenCL quando na verdade era a conversão do binding.
+        //
+        // Um np.ndarray guarda os floats contíguos: 4 bytes cada.
         .def("to_float", [](const Safetensors& st, const std::string& name) {
-            return st.to_float(st.get(name));  // std::vector<float> -> list
-        }, py::arg("name"))
+            std::vector<float> v = st.to_float(st.get(name));
+            py::array_t<float> out((py::ssize_t)v.size());
+            std::memcpy(out.mutable_data(), v.data(), v.size() * sizeof(float));
+            return out;
+        }, py::arg("name"), "Tensor as a numpy float32 array (converted)")
         .def("read_rows", [](const Safetensors& st, const std::string& name,
                              int row_start, int n_rows) {
             // Row-bounded read. MEMORY FIX (2026-10-22): the previous version
