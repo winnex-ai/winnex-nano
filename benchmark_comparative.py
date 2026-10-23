@@ -4,21 +4,25 @@ Honest comparative benchmark — winnex-nano vs alternatives.
 
 Compares on REAL metrics, no cherry-picking:
   A. Tokenization: winnex-nano spectral vs BPE (transformers/Qwen2.5)
-  B. Streaming: winnex-nano ChunkEngine vs SGLang (if available)
+  B. Chunk generation: winnex-nano ChunkEngine (mede a máquina de chunks)
   C. WeightBalancer: weight fusion (correctness + speed)
 
 Honesty note:
-- winnex-nano is a DETERMINISTIC spectral tokenizer + fast-build streaming
-  engine. It does NOT generate text via a trained LLM — it emits chunks per
-  the caller's policy.
+- winnex-nano's ChunkEngine is a DETERMINISTIC chunk machine: it encodes text,
+  uses a Madhava index as vector working memory, and emits chunks per the
+  caller's policy. It does NOT generate text via a trained LLM.
+  NOTE ON THE WORD: this is NOT "streaming" in the inference sense (loading
+  weights in a flow to run a model larger than memory). Nothing here does that.
+  The class was called StreamEngine until 0.1.33; the name described the wrong
+  thing and was changed for that reason.
 - BPE/transformers generates text via a trained LLM. Different purposes.
   This benchmark compares what IS comparable: tokenization (A) and the
-  streaming infrastructure (B).
+  chunk-generation machinery (B).
 """
 import sys, os, time, json, statistics
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import _winnex_nano as wn
+import winnex_nano as wn
 
 # Realistic samples
 SAMPLES = [
@@ -98,7 +102,7 @@ def bench_stream():
             return " chunk" if len(chunks) < n else ""
         def sink(c):
             if not c.done: chunks.append(c.text)
-        engine.stream(BIG_TEXT[:500], next_chunk, sink)
+        engine.generate_chunks(BIG_TEXT[:500], next_chunk, sink)
         dt = (time.perf_counter() - t0) * 1000
         r[str(n)] = {'total_ms': round(dt, 1), 'per_chunk_ms': round(dt / n, 3)}
     return r
@@ -158,8 +162,8 @@ def main():
     else:
         print(f"  BPE unavailable: {bpe.get('error','?')}")
 
-    # B. Streaming
-    print("\n## B. STREAMING (chunks via Madhava fast build)")
+    # B. Chunk generation
+    print("\n## B. CHUNK GENERATION (ChunkEngine + Madhava fast build)")
     stream = bench_stream()
     for n, d in stream.items():
         print(f"  {n:>4} chunks: {d['total_ms']}ms total = {d['per_chunk_ms']}ms/chunk")
@@ -189,9 +193,12 @@ def main():
   but ~{density}x denser ({d64['bits_per_char']} bits/char vs ~{bpe_bits:.1f} bits/char BPE).
   -> Honest trade-off: autonomy/determinism vs compactness/speed.
 
-- STREAMING: winnex-nano streams at {stream.get('50',{}).get('per_chunk_ms','?')}ms/chunk
-  via the Madhava fast build (no HTTP, no external LLM). SGLang (removed)
-  had ~2-5s/response latency. -> The streaming infra is ~1000x lighter.
+- CHUNK GENERATION: {stream.get('50',{}).get('per_chunk_ms','?')}ms per chunk via the
+  Madhava fast build (no HTTP, no external LLM).
+  This is NOT comparable to an inference server's latency. SGLang was measured
+  on generating tokens with a trained LLM over HTTP; this measures a
+  deterministic chunk machine with no model. The difference is the work being
+  done, not the efficiency of two implementations of the same thing.
 
 - WEIGHT BALANCER: O(n) fusion with exact correctness (weighted mean).
   Lets the operator control alpha (cost/benefit) in multimodel fusion.
