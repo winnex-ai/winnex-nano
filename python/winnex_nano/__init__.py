@@ -46,6 +46,7 @@ from ._winnex_nano import (
     dense_matmul,
     rms_norm,
     load_config,
+    compiled_with_simd,
     EmbedBridge,
 )
 
@@ -92,6 +93,7 @@ __all__ = [
     "dense_matmul",
     "rms_norm",
     "load_config",
+    "compiled_with_simd",
     "EmbedBridge",
     "linear_merge",
     "slerp_merge",
