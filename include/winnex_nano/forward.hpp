@@ -2,21 +2,40 @@
  * forward.hpp — native forward pass for transformer LLMs (dense f32 + OpenCL).
  *
  * Processes hidden states through the model layers, driven by a config that
- * is READ from the model's config.json (arch-detected, model-agnostic):
+ * is READ from the model's config.json (arch-detected):
  *
  *   per layer i:
  *     h = RMSNorm(h, input_layernorm)                (rms_norm)
  *     q = DENSE(h, q_proj); k = DENSE(h, k_proj); v = DENSE(h, v_proj)
  *     q,k = RoPE(q,k, position)
- *     attn = GQA_attention(q, k, v)                  (QKᵀ + top-k, Madhava-style)
+ *     attn = GQA_attention(q, k, v)                  (softmax causal EXATA)
  *     h = h + DENSE(attn, o_proj)
  *     h = h + MLP(RMSNorm(h), gate/up/down)          (SiLU gating)
  *   logits = DENSE(RMSNorm(h), lm_head)              (tied to embed_tokens if tied)
  *
- * The input hidden states come from the X-factor embedding of the text
- * (XFactor.project(expand_spectral(histogram))) — no BPE, no vocabulary.
- * The attention uses the Madhava selective-top-K (no softmax over all): the
- * query attends to the top-k keys by bound, exactly like the engine prunes.
+ * ── O QUE ESTA CLASSE FAZ, E O QUE ELA NÃO FAZ ─────────────────────────────
+ *
+ * A versão anterior deste cabeçalho descrevia um motor que o código não é.
+ * Corrigido aqui, porque a documentação de topo é o que um usuário lê primeiro:
+ *
+ *   ATENÇÃO. É softmax causal EXATA — a função que os pesos pré-treinados
+ *   codificam. NÃO é top-k "Madhava-style" por padrão. Existe um caminho
+ *   seletivo opcional (MADHAVA_TOPK_ATTN=1) com garantia de massa descartada
+ *   controlada, mas ele: (a) está DESLIGADO por padrão; (b) só existe no ramo
+ *   CPU da atenção — com a atenção na GPU ele não tem efeito; (c) medido, não
+ *   acelera, porque todos os scores são computados de qualquer forma. Trocar a
+ *   atenção por top-k sem renormalizar já foi tentado neste código e o custo
+ *   está registrado em run_layer: perplexidade 2.0e7 contra 37.4 e correlação
+ *   ≈ 0 com a referência.
+ *
+ *   ENTRADA. O caminho de geração (prefill/step) recebe **token ids do
+ *   tokenizer do checkpoint** e lê as linhas do embed_tokens por mmap. O
+ *   X-factor embedding NÃO participa desse caminho. Ele existe em
+ *   compute_xfactor() e era a entrada de generate(), que é legado.
+ *
+ *   ARQUITETURAS. Densa apenas: qwen2, qwen3, llama, mistral. MoE
+ *   (qwen2_moe/qwen3_moe/mixtral), DeepSeek (MLA) e Gemma (GeGLU +
+ *   softcapping) são RECUSADAS em load_config — ver o gate lá.
  *
  * BSL 1.1 | pay@winnex.ai | (c) Winnex Brasil Soluções Empresariais LTDA-ME
  */
@@ -42,12 +61,17 @@ struct ModelConfig {
     int num_attention_heads = 0;
     int num_key_value_heads = 0;
     int head_dim = 0;
-    int max_position_embeddings = 0;
-    float rope_theta = 10000.0f;
-    float rms_norm_eps = 1e-6f;
+    int max_position_embeddings = 0;  // required — no default, see load_config
+    float rope_theta = 0.0f;          // required — 0 means "absent in config"
+    float rms_norm_eps = -1.0f;       // required — negative means "absent"
     bool tie_word_embeddings = true;
     int group_size = 128;            // GPTQ (legacy; the dense path ignores it)
     bool gptq = false;               // true when .qweight/.qzeros present
+    // True when config.json declares a sliding_window. This engine has no
+    // windowed attention, so load_config refuses it rather than attending to
+    // history the model was trained to ignore.
+    bool has_sliding_window = false;  // sliding_window present in config
+    int sliding_window = 0;           // its value; inert when >= max_position
 };
 
 // Loads a ModelConfig from a config.json (minimal parser).

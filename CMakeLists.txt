@@ -66,15 +66,36 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # o fonte correspondente entra junto — macro e fonte andam em par
     target_sources(madhava_reused PRIVATE ${MADHAVA_ROOT}/src/speed_opencl.cpp)
 endif()
-# Flags de arquitetura por COMPILADOR, não por SO. -mavx2/-mfma são do
-# GCC/Clang; o MSVC usa /arch:AVX2 e não reconhece as outras. E arm64 (Apple
-# Silicon, ARM Windows) não tem AVX2 — aplicar as flags ali quebra o build.
+#
+# ESTAS FLAGS TÊM DE CHEGAR AO ALVO `winnex_nano`, NÃO SÓ AO `madhava_reused`.
+#
+# Medido em 2026-10-24: estavam aplicadas apenas a `madhava_reused`. A biblioteca
+# `winnex_nano` — que contém `dense_matmul`, o laço da CPU — era compilada com
+# "-O3 -DNDEBUG" e nada mais (confirmado no build.ninja:
+# LANGUAGE_COMPILE_FLAGS = -O3 -DNDEBUG). O bloco AVX2 de tensor_ops.cpp está sob
+# `#if defined(__AVX2__)`: nunca compilava. Objdump do dense_matmul no binário
+# publicado mostrava zero instruções vfmadd.
+#
+# Custo medido do defeito: 3,5x no laço isolado (64,8 -> 228,2 GFLOP/s) e a mesma
+# razão no forward real, conforme forward.cpp:799 (30,5 s -> 9,1 s). No caminho
+# CPU — o único que roda modelos maiores que a placa — é a maior perda do código
+# para a menor correção possível.
+#
+# A macro WINNEX_COMPILED_WITH_SIMD é definida junto para que o runtime possa
+# REGISTRAR se o build recebeu SIMD, em vez de o usuário descobrir por benchmark.
+# Lista, não string: uma variável com "-mavx2 -mfma -funroll-loops" vira UM
+# argumento e o compilador recusa com "unrecognized command-line option".
+set(WINNEX_SIMD_FLAGS "")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
     if(MSVC)
-        target_compile_options(madhava_reused PRIVATE /O2 /arch:AVX2)
+        set(WINNEX_SIMD_FLAGS /arch:AVX2)
     else()
-        target_compile_options(madhava_reused PRIVATE -O3 -mavx2 -mfma -funroll-loops)
+        set(WINNEX_SIMD_FLAGS -mavx2 -mfma -funroll-loops)
     endif()
+    target_compile_options(madhava_reused PRIVATE ${WINNEX_SIMD_FLAGS})
+    message(STATUS "winnex-nano: SIMD do alvo winnex_nano = ${WINNEX_SIMD_FLAGS}")
+else()
+    message(STATUS "winnex-nano: sem AVX2 nesta arquitetura (${CMAKE_SYSTEM_PROCESSOR})")
 endif()
 if(OpenMP_CXX_FOUND)
     target_link_libraries(madhava_reused PUBLIC OpenMP::OpenMP_CXX)
@@ -105,6 +126,16 @@ target_include_directories(winnex_nano PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_include_directories(winnex_nano PRIVATE ${MADHAVA_ROOT}/vendor)
 target_link_libraries(winnex_nano PUBLIC madhava_reused)
 target_link_libraries(winnex_nano PRIVATE ${CMAKE_DL_LIBS})
+
+# O LAÇO DA CPU VIVE AQUI. Sem estas flags, dense_matmul compila o ramo escalar
+# de tensor_ops.cpp e o motor perde 3,5x no único caminho que roda modelos
+# maiores que a placa. Ver o bloco de comentário acima.
+if(NOT "${WINNEX_SIMD_FLAGS}" STREQUAL "")
+    target_compile_options(winnex_nano PRIVATE ${WINNEX_SIMD_FLAGS})
+    target_compile_definitions(winnex_nano PUBLIC WINNEX_COMPILED_WITH_SIMD=1)
+else()
+    target_compile_definitions(winnex_nano PUBLIC WINNEX_COMPILED_WITH_SIMD=0)
+endif()
 
 # --- Python bindings (pybind11) --------------------------------------------
 # scikit-build-core sets up Python3_ROOT_DIR / Python_EXECUTABLE in the build

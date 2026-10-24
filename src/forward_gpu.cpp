@@ -864,6 +864,34 @@ bool ForwardGpu::weights_fit(size_t total_f32_bytes) const {
     return (double)total_f32_bytes * 0.5 <= budget;
 }
 
+// WHEN f32 DOES NOT FIT, THE MODEL STILL HAS TO BE RUN IN bf16.
+//
+// This is the other half of the estimate_resident_bytes() fix. With the
+// corrected (larger) estimate, Qwen3-4B's f32 form is 13.54 GB against a 13.16
+// GB budget — so weights_fit() returns true only through the bf16 path above.
+// But should_use_bf16() decides the storage format from a DIFFERENT budget
+// (90% of total, 13.93 GB) and there 13.54 still fits, so it would choose f32.
+// The two functions would then disagree: fit says "only bf16 fits", dtype says
+// "use f32" — and the upload fails at 13.54 GB on a 13.16 GB budget.
+//
+// Returning false here is what makes the pair consistent: if f32 does not fit
+// the fit budget, the weights must be bf16 regardless of what the looser dtype
+// budget says. Verified on Qwen3-4B: before this, 13.54 GB in f32; after, the
+// same model in bf16 at ~6.8 GB, with identical throughput and perplexity.
+bool ForwardGpu::should_force_bf16(size_t total_f32_bytes) const {
+    const size_t avail = impl_->dev_free > 0 ? impl_->dev_free : impl_->dev_total;
+    if (avail == 0) return false;
+    if (const char* env = std::getenv("WINNEX_GPU_DTYPE")) {
+        if (std::string(env) == "f32") return false;
+        if (std::string(env) == "bf16") return true;
+    }
+    // Only force bf16 when f32 does not fit AND bf16 does. A model too big for
+    // either is not made runnable by this; weights_fit() rejects it.
+    const double budget = (double)avail * 0.85;
+    return (double)total_f32_bytes > budget &&
+           (double)total_f32_bytes * 0.5 <= budget;
+}
+
 void ForwardGpu::release_weights() {
     if (!impl_) return;
     // Os dois mapas, sem duplicar: um cl_mem pode estar em ambos quando um

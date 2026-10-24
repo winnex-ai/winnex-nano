@@ -151,8 +151,15 @@ print(eng.weight_mode)      # "device" | "resident" | "stream" | "cpu"
 | Mode | What lives where | When |
 |------|------------------|------|
 | `device` | every projection on the GPU (bf16 when f32 does not fit); host keeps only norms and biases | the model fits in VRAM |
-| `resident` | every projection in host RAM, stable pointers | fits in 60% of available RAM, no usable GPU |
-| `stream` | one layer at a time through a scratch buffer | otherwise |
+| `stream` | one layer at a time through a scratch buffer | half the model fits the device but the whole does not |
+| `cpu` | nothing on the device | the model does not fit even at bf16 |
+
+> **`resident` is not reachable through `enable_gpu()`.** It is computed only
+> when no device was created — and `enable_gpu()` creates the device first, and
+> throws if it cannot. The mode remains in `weight_mode()`'s vocabulary and in
+> the code that selects it, but there is no public call that reaches it without
+> a GPU. Treat the table above as the actual contract; `resident` is dead code
+> reachable only by editing the source.
 
 Measured on an RTX 5060 Ti (16 GB) and a 31 GB host, Qwen2.5-7B, 131 tokens:
 
@@ -168,6 +175,72 @@ them to f32. Nothing is lost that was ever in the file.
 RSS stays high in both rows because the payload is *mapped*: those pages are the
 file, evictable under pressure, not heap. The number that decides whether a model
 fits a machine is the anonymous column.
+
+## Attention: exact softmax, and the Madhava mode
+
+The default is **exact causal softmax** — the function the pretrained weights
+encode. It is not negotiable: replacing it with a top-k filter that does not
+renormalise was tried in this codebase, and the cost is recorded in `run_layer`:
+perplexity 2.0e7 against 37.4, correlation ≈ 0 with the reference.
+
+`MADHAVA_TOPK_ATTN=1` enables the **selective mode**: keys are pruned while the
+mass they account for stays within `MADHAVA_EPSILON_MASS` (default 1e-4) of the
+full softmax mass. The dropped set is renormalised, so the weights still form a
+distribution. The guarantee is exact, not a score bound:
+`‖attn_full − attn_pruned‖₁ ≤ 2ε`.
+
+Three facts measured on 2026-10-23, Qwen2.5-0.5B, 80 LAMBADA items:
+
+| Arm | LAMBADA | prefill tok/s |
+|---|---:|---:|
+| CPU, softmax | 35.0% | 50.83 |
+| CPU, `MADHAVA_TOPK_ATTN=1`, ε=1e-4 | 35.0% | 50.54 |
+| CPU, `MADHAVA_TOPK_ATTN=1`, ε=0.05 | 36.2% | 50.53 |
+
+- **Quality is preserved** — all three inside the confidence interval
+  (the guarantee holds).
+- **It does not accelerate.** Computing every score is O(n·d), the same work as
+  full softmax; what is saved is the value accumulation, which only dominates
+  when the context is long. At 97 tokens the difference is noise.
+- **It is CPU-only.** The selective block lives inside the CPU branch of
+  `run_layer`. With attention on the GPU the variable has **no effect** —
+  verified: identical LAMBADA and prefill. And the CPU attention arm is 7.4×
+  slower than the GPU one (50.8 vs 376 tok/s), so reaching the filter costs far
+  more than it can save at short context.
+
+Honest use: an **auditable discard guarantee**, not a speed lever. Tested at
+512 → 8192 tokens, 25 combinations of epsilon (1e-4 to 0.2) x context length,
+on the CPU arm where the filter actually exists:
+
+```
+softmax exact:  512 54.3 tok/s | 1024 50.8 | 2048 43.4 | 4096 32.8 | 8192 21.8
+selective:      time ratio min 0.997, max 1.015, mean 1.003
+                logit divergence: max 0.00e+00
+```
+
+The time does not fall at any length, for any epsilon, and the logits are
+bit-identical — at these sizes the filter discards less than float noise. The
+code comment claimed the saving lives in the value accumulation "which dominates
+only when n is large"; **that hypothesis is falsified up to 8k tokens**. The
+score computation is the bottleneck and the filter does not avoid it. Porting it
+to the device is therefore not justified by these numbers.
+
+## Supported architectures
+
+Dense only: **qwen2, qwen3, llama, mistral**. `load_config` refuses everything
+else by name, because a model whose maths differs loads cleanly and produces a
+plausible-looking perplexity that is wrong:
+
+| Refused | Why |
+|---|---|
+| `qwen2_moe`, `qwen3_moe`, `mixtral` | need a top-k router over N experts; not implemented |
+| `deepseek_v2`, `deepseek_v3` | need MLA (latent attention); not implemented |
+| `gemma`, `gemma2` | GeGLU, logit softcapping, sliding window |
+
+This list is a contract, not an aspiration. It previously named four MoE
+architectures the engine had no code for — the failure surfaced as "tensor not
+found" rather than "architecture unsupported", with the list telling the user
+the model was supported.
 
 ### Why it is built this way
 

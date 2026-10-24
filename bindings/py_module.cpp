@@ -433,6 +433,20 @@ PYBIND11_MODULE(_winnex_nano, m) {
         .def_readwrite("gptq", &ModelConfig::gptq);
     m.def("load_config", &load_config, py::arg("config_path"));
 
+    // --- Build diagnostics --------------------------------------------------
+    //
+    // Se o build recebeu AVX2/FMA. Isto existe porque o defeito era INVISÍVEL:
+    // as flags de arquitetura estavam aplicadas só ao alvo `madhava_reused`, e
+    // o `dense_matmul` do motor compilava o ramo escalar. Ninguém descobria
+    // isso lendo o código — só por benchmark. Agora o runtime responde.
+    m.def("compiled_with_simd", []() {
+#ifdef WINNEX_COMPILED_WITH_SIMD
+        return WINNEX_COMPILED_WITH_SIMD != 0;
+#else
+        return false;
+#endif
+    }, "true when dense_matmul was compiled with AVX2+FMA (3.5x on the CPU path)");
+
     // --- ForwardEngine (native dense forward) ------------------------------
     py::class_<ForwardEngine>(m, "ForwardEngine")
         .def(py::init<const ModelConfig&, const Safetensors&>(), py::arg("cfg"),

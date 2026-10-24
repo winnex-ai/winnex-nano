@@ -106,6 +106,17 @@ public:
      */
     bool weights_fit(size_t total_f32_bytes) const;
 
+    /**
+     * True when the weights MUST be uploaded as bf16: the f32 form exceeds the
+     * 85% fit budget but the bf16 form fits inside it.
+     *
+     * This exists so weights_fit() and should_use_bf16() cannot disagree. They
+     * use different budgets (85% and 90%), and with a model whose f32 form sits
+     * between them the pair would answer "only bf16 fits" and "use f32" at the
+     * same time — and the upload would fail.
+     */
+    bool should_force_bf16(size_t total_f32_bytes) const;
+
     /** Drop every weight from the device and return to the streaming path. */
     void release_weights();
 

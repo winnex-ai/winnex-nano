@@ -77,19 +77,42 @@ ModelConfig load_config(const std::string& config_path) {
     // Those load cleanly and produce plausible-looking perplexity that is
     // simply wrong. An earlier version of the Kaggle benchmark listed "gemma"
     // and "gemma2" as supported and would have reported a number for them.
+    //
+    // A LISTA É O CONTRATO. Ela só pode conter o que o código de fato executa.
+    //
+    // Medido em 2026-10-23: a lista tinha nove entradas, e quatro delas eram
+    // MoE (qwen2_moe, qwen3_moe, mixtral) ou atenção latente (deepseek_v2/v3).
+    // O motor não tem uma linha de nenhuma das duas:
+    //
+    //     $ grep -niE "router|expert|moe|num_experts" src/forward.cpp
+    //     82:            "qwen2_moe", "qwen3_moe",      <- só a linha da lista
+    //
+    // Um Qwen2-MoE guarda mlp.experts.{i}.* e mlp.gate; o loader pede
+    // mlp.gate_proj/up_proj/down_proj, que não existem nesses checkpoints. A
+    // carga falhava — mas falhava com "tensor não encontrado", não com
+    // "arquitetura não suportada", enquanto a lista dizia ao usuário que o
+    // modelo era suportado. Um checkpoint MoE densificado ou híbrido passaria e
+    // rodaria errado.
+    //
+    // O gate existe para impedir exatamente isso. Uma lista que anuncia o que o
+    // código não faz é pior que não ter lista: transfere ao usuário a tarefa de
+    // descobrir que o anúncio era falso.
     {
         static const char* kSupported[] = {
-            "qwen2", "qwen2_moe", "qwen3", "qwen3_moe",
-            "llama", "mistral", "mixtral", "deepseek_v2", "deepseek_v3",
+            "qwen2", "qwen3", "llama", "mistral",
         };
         bool ok = false;
         for (const char* a : kSupported) if (c.arch == a) { ok = true; break; }
         if (!ok) {
             throw std::runtime_error(
                 "ForwardEngine: architecture '" + c.arch + "' is not implemented. "
-                "Supported: qwen2/qwen3/llama/mistral family (RMSNorm, RoPE, "
-                "SwiGLU, GQA). Gemma needs GeGLU + logit softcapping + sliding "
-                "window; it would load and produce a wrong perplexity.");
+                "Supported: qwen2, qwen3, llama, mistral (dense: RMSNorm, RoPE, "
+                "SwiGLU, GQA). Deliberately REFUSED rather than run wrong: MoE "
+                "(qwen2_moe, qwen3_moe, mixtral) needs a top-k router over N "
+                "experts, which this engine does not have; deepseek_v2/v3 need "
+                "MLA; gemma needs GeGLU + logit softcapping + sliding window. "
+                "All of them would load and produce a plausible-looking "
+                "perplexity that is simply wrong.");
         }
     }
     c.vocab_size = find_int("vocab_size", 0);
@@ -98,10 +121,74 @@ ModelConfig load_config(const std::string& config_path) {
     c.num_hidden_layers = find_int("num_hidden_layers", 0);
     c.num_attention_heads = find_int("num_attention_heads", 0);
     c.num_key_value_heads = find_int("num_key_value_heads", c.num_attention_heads);
-    c.max_position_embeddings = find_int("max_position_embeddings", 2048);
-    c.rope_theta = find_float("rope_theta", 10000.0f);
-    c.rms_norm_eps = find_float("rms_norm_eps", 1e-6f);
+    c.max_position_embeddings = find_int("max_position_embeddings", 0);
+    c.rope_theta = find_float("rope_theta", 0.0f);
+    c.rms_norm_eps = find_float("rms_norm_eps", -1.0f);
     c.tie_word_embeddings = find_int("tie_word_embeddings", 1) == 1;
+    c.sliding_window = find_int("sliding_window", 0);
+    c.has_sliding_window = c.sliding_window > 0;
+
+    // ── DEFAULTS QUE INVENTAM VALORES SÃO FALSOS NEGATIVOS ────────────────
+    //
+    // These fields used to have plausible defaults: max_position_embeddings
+    // 2048, rope_theta 10000, rms_norm_eps 1e-6. A config that omitted them
+    // loaded "fine" and ran with a WRONG RoPE base or a WRONG context ceiling —
+    // the engine silently behaved like a different model. Found in practice: a
+    // checkpoint with a 32k window and no max_position_embeddings was cut at
+    // 2048 positions, and the only symptom was an "out of range" error twenty
+    // thousand tokens later.
+    //
+    // The rule now: a REQUIRED value that is absent is an error, not a guess.
+    // The legitimate derivations are num_key_value_heads = num_attention_heads
+    // (that IS what MHA means when the key is absent) and head_dim =
+    // hidden/heads (what Qwen2 and Llama actually use).
+    {
+        std::string missing;
+        auto need = [&](double v, const char* name) {
+            if (v <= 0.0) missing += std::string(" ") + name;
+        };
+        need(c.vocab_size, "vocab_size");
+        need(c.hidden_size, "hidden_size");
+        need(c.intermediate_size, "intermediate_size");
+        need(c.num_hidden_layers, "num_hidden_layers");
+        need(c.num_attention_heads, "num_attention_heads");
+        need(c.max_position_embeddings, "max_position_embeddings");
+        need(c.rope_theta, "rope_theta");
+        need(c.rms_norm_eps, "rms_norm_eps");
+        if (!missing.empty()) {
+            throw std::runtime_error(
+                "ForwardEngine: config.json is missing required field(s):" + missing +
+                ". These have no safe default — guessing them (2048 positions, "
+                "rope_theta 10000) makes the engine run a different model than "
+                "the checkpoint describes. Fix the config instead of letting it "
+                "load.");
+        }
+    }
+
+    // A sliding window means the model attends to a truncated history — a
+    // different function, and this engine has no windowed attention. Same
+    // contract as the architecture gate: refuse rather than run wrong.
+    //
+    // BUT a window that is >= max_position_embeddings is INERT: it never binds,
+    // so the model attends to the full causal history anyway and full attention
+    // is exactly right. Qwen2.5-0.5B declares sliding_window=32768 with a 32768
+    // context; Qwen2.5-7B declares 131072 with 32768. Neither truncates.
+    //
+    // This distinction is the whole point of "no false negatives": refusing on
+    // the mere PRESENCE of the key would have refused every Qwen2.5 checkpoint —
+    // the exact models this engine runs and was validated against. Caught by
+    // running it: the first version of this guard rejected Qwen2.5-0.5B.
+    if (c.has_sliding_window &&
+        c.sliding_window < c.max_position_embeddings) {
+        throw std::runtime_error(
+            "ForwardEngine: config declares sliding_window=" +
+            std::to_string(c.sliding_window) + " against " +
+            std::to_string(c.max_position_embeddings) + " positions, so the "
+            "window BINDS and this engine cannot honour it: it implements full "
+            "causal attention. Running it would attend to history the model was "
+            "trained to ignore. (A window >= max_position_embeddings is inert "
+            "and is accepted.)");
+    }
     // HEAD_DIM: prefer the explicit value from config.json, fall back to
     // hidden/heads only when it is absent.
     //
@@ -674,11 +761,32 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     std::vector<float> mlp_out(seq_len * H);
     std::vector<float> gate(seq_len * w.inter), up(seq_len * w.inter);
     if (gpu_ != nullptr) {
-        // gate and up share the same input, so they are two GEMMs against the
-        // same A — the only reason they are not one call is that their output
-        // widths are equal but the weights are separate tensors. The SiLU
-        // gating stays on the CPU (it is elementwise and cheap).
-        if (device_weights_) {
+        // gate and up share the same input A and have the same output width.
+        //
+        // FUSED (2026-10-24): they were two matmul_device calls, which sent A to
+        // the device twice per layer and launched two kernels. Since
+        // warm_device_weights() now uploads a single [2·inter, H] buffer under
+        // the tag "gate_up_proj", this is ONE call: A crosses the bus once, one
+        // kernel runs, and the result comes back as [seq, 2·inter] with gate in
+        // columns [0, inter) and up in [inter, 2·inter).
+        //
+        // This is the fusion the Madhava engine already demonstrates in
+        // qkt_fused_topk: compute both stages against the same loaded operand
+        // in one pass. Gain is ~2% of the forward (one call out of 7 per layer)
+        // — real, small, and it belongs behind the big items, not in front.
+        if (device_weights_ && gpu_->has_weight(("L" + std::to_string(layer) + ".gate_up_proj").c_str())) {
+            std::vector<float> gu((size_t)seq_len * 2 * w.inter);
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".gate_up_proj").c_str(),
+                                hn2.data(), seq_len, 2 * w.inter, H, nullptr, gu.data());
+            for (int t = 0; t < seq_len; ++t) {
+                std::memcpy(gate.data() + (size_t)t * w.inter,
+                            gu.data() + (size_t)t * 2 * w.inter,
+                            (size_t)w.inter * sizeof(float));
+                std::memcpy(up.data() + (size_t)t * w.inter,
+                            gu.data() + (size_t)t * 2 * w.inter + w.inter,
+                            (size_t)w.inter * sizeof(float));
+            }
+        } else if (device_weights_) {
             gpu_->matmul_device(("L" + std::to_string(layer) + ".gate_proj").c_str(),
                                 hn2.data(), seq_len, w.inter, H, nullptr, gate.data());
             gpu_->matmul_device(("L" + std::to_string(layer) + ".up_proj").c_str(),
@@ -907,21 +1015,37 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
             // O modelo não cabe no device. Warmup pode já ter subido parte;
             // liberar garante que cada peso viva em um lugar só.
             gpu_->release_weights();
-            // STREAM só faz sentido se o device ainda for útil para as
-            // ativações. Quando nem metade do modelo cabe, o streaming enche a
-            // VRAM e falha — medido no 14B: 15.618 MB de 15.872 e então -4.
-            // Nesse caso o caminho honesto é CPU, e o motivo fica registrado.
-            if (!device_mode_viable()) {
+            //
+            // `stream` FOI REMOVIDO DO CAMINHO DE FALLBACK (2026-10-24).
+            //
+            // Ele não é um fallback: é um modo que o próprio README documenta
+            // como MAIS LENTO QUE A CPU (90,8 s contra 67,0 s no 7B), porque
+            // reenvia o modelo inteiro a cada forward. Escolhê-lo quando o
+            // modelo não cabe no device é responder "não cabe" degradando o
+            // desempenho sem avisar — um falso positivo de capacidade.
+            //
+            // O caminho honesto é CPU, com o motivo registrado em
+            // gpu_refusal(). Nada se perde: `stream` continua existindo e
+            // selecionável por quem souber que quer isso (WINNEX_WEIGHT_MODE=
+            // stream), mas não é mais o que o motor escolhe sozinho quando falha.
+            const char* want = std::getenv("WINNEX_WEIGHT_MODE");
+            const bool user_wants_stream = want && std::string(want) == "stream";
+            if (user_wants_stream && device_mode_viable()) {
+                weight_mode_ = "stream";
+            } else {
+                const double need_gb = estimate_resident_bytes() / 2.0 / 1073741824.0;
+                const double have_gb = gpu_->device_memory_total() / 1073741824.0;
                 delete gpu_;
                 gpu_ = nullptr;
                 weight_mode_ = "cpu";
-                gpu_refusal_ =
-                    "model does not fit the device even at bf16: " +
-                    std::to_string((long long)(estimate_resident_bytes() / 2 / 1073741824.0 * 10) / 10.0) +
-                    " GB needed, " +
-                    " GB available";
-            } else {
-                weight_mode_ = "stream";
+                char buf[512];
+                std::snprintf(buf, sizeof buf,
+                    "model does not fit the device: needs %.1f GB at bf16, "
+                    "device has %.1f GB. Running on the CPU, which is FASTER "
+                    "than the stream fallback for an oversized model (measured "
+                    "90.8 s against 67.0 s on the 7B). Set WINNEX_WEIGHT_MODE="
+                    "stream to force the stream path.", need_gb, have_gb);
+                gpu_refusal_ = buf;
             }
         }
     }
@@ -979,8 +1103,33 @@ bool ForwardEngine::warm_device_weights() {
         push("k_proj",    L + "self_attn.k_proj", w.kv_out, H, w.k_b);
         push("v_proj",    L + "self_attn.v_proj", w.kv_out, H, w.v_b);
         push("o_proj",    L + "self_attn.o_proj", H, w.q_out, {});
-        push("gate_proj", L + "mlp.gate_proj", inter, H, {});
-        push("up_proj",   L + "mlp.up_proj", inter, H, {});
+
+        // GATE + UP FUSED into one [2·inter, H] buffer.
+        //
+        // run_layer asks for the tag "gate_up_proj" and gets both projections
+        // from one kernel, with A uploaded once instead of twice. This is the
+        // same fusion the Madhava engine uses in qkt_fused_topk.
+        //
+        // The two source tensors are read and concatenated on the host. That
+        // peeks at 2·inter·H floats (~0.4 GB for the 4B) instead of the
+        // one-matrix-at-a-time discipline used above; it is the price of the
+        // fusion and it stays under the same host ceiling as before, because
+        // gate+up were always the two largest matrices and now they are read
+        // contiguously rather than one after the other.
+        {
+            std::vector<float> g = st_->to_float(st_->get(L + "mlp.gate_proj.weight"));
+            std::vector<float> u = st_->to_float(st_->get(L + "mlp.up_proj.weight"));
+            std::vector<float> gu2;
+            gu2.reserve(g.size() + u.size());
+            gu2.insert(gu2.end(), g.begin(), g.end());
+            gu2.insert(gu2.end(), u.begin(), u.end());
+            std::vector<float>().swap(g);
+            std::vector<float>().swap(u);
+            out.assign((size_t)2 * inter, 0.0f);
+            gpu_->matmul(dummy.data(), 1, gu2.data(), 2 * inter, H,
+                         nullptr, out.data(), (T + "gate_up_proj").c_str());
+            std::vector<float>().swap(gu2);
+        }
         push("down_proj", L + "mlp.down_proj", H, inter, {});
     }
     } catch (const std::exception&) {
@@ -1001,20 +1150,37 @@ bool ForwardEngine::warm_device_weights() {
 
 // Byte cost of holding every layer resident in float32.
 //
-// The projection shapes are q_proj [H, H], k_proj [kv, H], v_proj [kv, H],
-// o_proj [H, H], gate/up [inter, H], down [H, inter]. That is 2·H² + 2·H·kv
-// for attention and 3·H·inter for the MLP — NOT 4·H², which double-counts one
-// H×H (I wrote that first and it over-estimated the 7B by 2.7 GB).
+// BUG FIX (2026-10-24): this used 2·H² for q_proj + o_proj, i.e. it assumed
+// q_out == hidden_size. Qwen3 decouples head_dim from H/heads, so q_out is
+// heads·head_dim (32·128 = 4096) and not H (2560). The estimate came out
+// 1.06 GB BELOW the truth on Qwen3-4B, and the measurement shows it directly:
+//
+//     [gpu] fit=1 ... total=12.48GB devbytes=13.54GB
+//
+// The engine printed 12.48 GB and deposited 13.54 GB. Same defect the loader
+// had (see load_layer) — that one was fixed, this one was not.
+//
+// Consequence, measured: with the wrong estimate, weights_fit() (85% budget =
+// 13.16 GB) accepted f32 on a 16 GB card, which is correct by luck. On a 12 GB
+// card it rejected f32 AND bf16, so the engine fell back to `stream` — the mode
+// its own README documents as slower than the CPU — when bf16 would have fit
+// and run on the device.
 double ForwardEngine::estimate_resident_bytes() const {
     const double H = (double)cfg_.hidden_size;
     const double inter = (double)cfg_.intermediate_size;
     const double kv = (double)cfg_.head_dim * (double)cfg_.num_key_value_heads;
-    const double per_layer = 2.0 * H * H      // q_proj + o_proj
-                           + 2.0 * H * kv     // k_proj + v_proj
-                           + 3.0 * H * inter  // gate + up + down
-                           + 2.0 * H          // in_norm + post_norm
-                           + 2.0 * kv         // k/v biases
-                           + 1.0 * H;         // q bias
+    // q_proj is [heads·head_dim, H] and o_proj is [H, heads·head_dim]. They are
+    // NOT [H, H] when head_dim is decoupled (Qwen3). load_layer already uses
+    // this shape; the estimator has to agree with it or the two disagree about
+    // how big the model is.
+    const double q_out = (double)cfg_.num_attention_heads * (double)cfg_.head_dim;
+    const double per_layer = H * q_out            // q_proj
+                           + H * q_out            // o_proj
+                           + 2.0 * H * kv         // k_proj + v_proj
+                           + 3.0 * H * inter      // gate + up + down
+                           + 2.0 * H              // in_norm + post_norm
+                           + 2.0 * kv             // k/v biases
+                           + 1.0 * H;             // q bias
     return per_layer * (double)cfg_.num_hidden_layers * 4.0;   // float32
 }
 
