@@ -160,6 +160,32 @@ static int run_growth_check(const std::string& dir) {
             printf("OK (%s): %d posicoes, %d passos de decode\n",
                    c.what, c.len, c.steps);
         }
+
+        // ── O caminho do forward(), que a perplexidade usa ────────────────
+        //
+        // Este foi o SEGUNDO lugar onde o mesmo defeito apareceu. A primeira
+        // correção cobriu só step(); o kernel voltou a falhar dentro de
+        // forward(), que monta caches locais com cache_pos = 0 e nunca reservava
+        // no device. Corrigir por chamador era o erro: são três entradas
+        // (prefill, step, forward) e cada uma cresce de um jeito. A correção
+        // final ficou em run_layer(), que todas usam.
+        for (int len : {256, 512, 600}) {
+            auto ids = test_ids(V, len);
+            std::vector<float> h = fe.embed_ids(ids);
+            std::vector<float> lg = fe.forward(h, len, /*all_positions=*/true);
+            const size_t want = (size_t)len * (size_t)V;
+            if (lg.size() != want) {
+                printf("FALHOU (forward %d): devolveu %zu logits, esperado %zu\n",
+                       len, lg.size(), want);
+                return 1;
+            }
+            for (size_t i = 0; i < lg.size(); i += (size_t)V)
+                if (!std::isfinite(lg[i])) {
+                    printf("FALHOU (forward %d): logit nao-finito\n", len);
+                    return 1;
+                }
+            printf("OK (forward %d posicoes): %zu logits\n", len, lg.size());
+        }
         printf("CRESCIMENTO OK | nenhuma reserva de KV estourou\n");
         return 0;
     } catch (const std::exception& e) {
