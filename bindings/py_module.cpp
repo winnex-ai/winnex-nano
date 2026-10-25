@@ -428,6 +428,16 @@ PYBIND11_MODULE(_winnex_nano, m) {
         .def_readwrite("num_key_value_heads", &ModelConfig::num_key_value_heads)
         .def_readwrite("head_dim", &ModelConfig::head_dim)
         .def_readwrite("rope_theta", &ModelConfig::rope_theta)
+        // Diagnóstico do rope_scaling: sem estes campos, "o motor leu o scaling"
+        // é afirmação sem verificação do lado Python.
+        .def_readwrite("rope_type", &ModelConfig::rope_type)
+        .def_readwrite("rope_factor", &ModelConfig::rope_factor)
+        .def_readwrite("rope_low_freq_factor", &ModelConfig::rope_low_freq_factor)
+        .def_readwrite("rope_high_freq_factor", &ModelConfig::rope_high_freq_factor)
+        .def_readwrite("rope_original_max_pos", &ModelConfig::rope_original_max_pos)
+        .def_readwrite("max_position_embeddings", &ModelConfig::max_position_embeddings)
+        .def_readwrite("has_sliding_window", &ModelConfig::has_sliding_window)
+        .def_readwrite("sliding_window", &ModelConfig::sliding_window)
         .def_readwrite("rms_norm_eps", &ModelConfig::rms_norm_eps)
         .def_readwrite("tie_word_embeddings", &ModelConfig::tie_word_embeddings)
         .def_readwrite("gptq", &ModelConfig::gptq);
@@ -509,18 +519,49 @@ PYBIND11_MODULE(_winnex_nano, m) {
             return e.gpu_attention(); })
         // Teste direto do kernel de atenção, sem passar pelo forward: isola
         // um defeito de kernel de um defeito no caminho do modelo.
+        // `ctx` e `cache_pos` existiam na assinatura C++ e eram fixados aqui em
+        // `seq` e `0`. Isso esconde exatamente o caso que domina o custo: no
+        // decode, seq=1 e ctx=N. Sem eles o diagnóstico só media prefill
+        // (seq == ctx), que é a carga em que a atenção é barata.
         .def("attention_raw", [](ForwardEngine& e,
                                  py::array_t<float, py::array::c_style | py::array::forcecast> Q,
                                  py::array_t<float, py::array::c_style | py::array::forcecast> K,
                                  py::array_t<float, py::array::c_style | py::array::forcecast> V,
-                                 int seq, int nh, int nkv, int hd) {
+                                 int seq, int nh, int nkv, int hd,
+                                 int ctx, int cache_pos) {
             py::array_t<float> O(std::vector<py::ssize_t>{seq, nh, hd});
             e.attention_raw((const float*)Q.request().ptr, (const float*)K.request().ptr,
                             (const float*)V.request().ptr, O.mutable_data(),
-                            seq, seq, nh, nkv, hd, 0);
+                            seq, ctx, nh, nkv, hd, cache_pos);
             return O;
         }, py::arg("Q"), py::arg("K"), py::arg("V"),
-           py::arg("seq"), py::arg("nh"), py::arg("nkv"), py::arg("hd"))
+           py::arg("seq"), py::arg("nh"), py::arg("nkv"), py::arg("hd"),
+           py::arg("ctx") = -1, py::arg("cache_pos") = 0)
+        // Device-side timing. "the GPU should be faster" is not measurable
+        // without it: kernel_ms against the wall clock says how much of a token
+        // is compute and how much is host work plus bus round-trips.
+        .def("profiling_enable", &ForwardEngine::profiling_enable, py::arg("on"))
+        .def_property_readonly("profiling_kernel_ms",
+                               &ForwardEngine::profiling_kernel_ms)
+        .def_property_readonly("profiling_wall_ms",
+                               &ForwardEngine::profiling_wall_ms)
+        .def_property_readonly("profiling_attn_ms",
+                               &ForwardEngine::profiling_attn_ms)
+        // Quantos launches de atenção, não só quanto tempo. Sem o contador,
+        // "a atenção custa X ms" não distingue um kernel caro de muitos
+        // kernels baratos -- e a diferença decide se otimizar o kernel ou
+        // fundir launches.
+        .def_property_readonly("profiling_attn_calls",
+                               &ForwardEngine::profiling_attn_calls)
+        .def_property_readonly("profiling_kernels",
+                               &ForwardEngine::profiling_kernels)
+        .def_property_readonly("profiling_by_tag", [](const ForwardEngine& e) {
+            py::dict d;
+            for (const auto& kv : e.profiling_by_tag())
+                d[py::str(kv.first)] = py::make_tuple(kv.second.first,
+                                                      kv.second.second / 1e6);
+            return d;
+        })
         .def_property_readonly("gpu_refusal", &ForwardEngine::gpu_refusal)
         .def_property_readonly("resident_bytes", &ForwardEngine::estimate_resident_bytes)
         .def_static("available_ram_bytes", &ForwardEngine::available_ram_bytes);

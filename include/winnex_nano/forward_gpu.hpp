@@ -1,3 +1,4 @@
+#include <vector>
 // forward_gpu.hpp — OpenCL dense projections for the native forward pass.
 //
 // Moves the DENSE MATRIX WORK of the transformer layers to the GPU while the
@@ -80,6 +81,17 @@ public:
     /** True when `tag` is resident on the device. */
     bool has_weight(const char* tag) const;
 
+    // Device-side timing. Requires CL_QUEUE_PROFILING_ENABLE on the queue (set
+    // unconditionally above) and the clGetEventProfilingInfo entry point.
+    void profiling_enable(bool on);
+    double profiling_kernel_ms() const;
+    double profiling_wall_ms() const;
+    double profiling_attn_ms() const;
+    int    profiling_attn_calls() const;
+    int    profiling_kernels() const;
+    double profiling_elems() const;
+    std::vector<std::pair<std::string, std::pair<int, double>>> profiling_by_tag() const;
+
     /**
      * Self-attention causal completa no device.
      *
@@ -93,6 +105,27 @@ public:
 
     /** True quando o kernel de atenção compilou. */
     bool has_attention() const;
+
+    /**
+     * KV cache persistente no device.
+     *
+     * prepare_kv() aloca um par de buffers por camada, dimensionado para
+     * `ctx_max` posições, e é chamado a cada prefill/reset (os buffers são
+     * reaproveitados). Devolve false quando a alocação falha; nesse caso o
+     * chamador continua usando attention(), que reenvia o cache por chamada —
+     * mais lento, mas correto. Nunca deixa estado parcial.
+     *
+     * Attention_resident() escreve SÓ as posições novas a partir de
+     * `cache_pos` e faz o kernel ler K/V do device. É a diferença entre mover
+     * seq*nkv*hd*4 bytes e mover nkv*hd*4 bytes por camada por token.
+     */
+    bool prepare_kv(int ctx_max, int nkv, int hd, int n_layers);
+    void release_kv();
+    bool has_kv(int layer) const;
+
+    void attention_resident(int layer, const float* Q,
+                            const float* K, const float* V, float* O,
+                            int seq, int nh, int nkv, int hd, int cache_pos);
 
     /** Device memory total and free, in bytes (0 when the driver will not say). */
     size_t device_memory_total() const;

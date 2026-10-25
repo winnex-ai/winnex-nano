@@ -22,11 +22,14 @@
 
 #include <CL/cl.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <map>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -59,6 +62,13 @@ static void* fg_sym(void* h, const char* n) { return dlsym(h, n); }
 
 namespace {
 
+// Grid e tile do kernel paralelo de atenção. Ficam fora do source CL para que
+// o host e o kernel usem o MESMO número: o elenco do grid no host e o
+// reqd_work_group_size do kernel têm que concordar, e dois literais separados
+// divergem sem erro de compilação.
+constexpr int kAttTg = 64;      // work-items por linha de atenção
+constexpr int kAttHdMax = 128;  // maior head_dim que cabe no tile local
+
 // The function pointers we resolve. The types come from the real CL headers,
 // so a signature drift is a compile error rather than silent corruption.
 struct FgApi {
@@ -87,15 +97,39 @@ struct FgApi {
                                    const void*, cl_uint, const cl_event*, cl_event*);
     cl_int (*clGetMemObjectInfo)(cl_mem, cl_mem_info, size_t, void*, size_t*);
     cl_int (*clFinish)(cl_command_queue);
+    // NOT resolved by FG_LOAD: a loader that exports neither would otherwise
+    // be reported as "missing" and abort initialisation. Resolved optionally
+    // below; a null here only disables the timing instrumentation.
+    cl_int (*clGetEventProfilingInfo)(cl_event, cl_profiling_info, size_t, void*, size_t*);
+    cl_int (*clReleaseEvent)(cl_event);
     cl_int (*clReleaseMemObject)(cl_mem);
     cl_int (*clReleaseKernel)(cl_kernel);
     cl_int (*clReleaseProgram)(cl_program);
+    // Opcional. Só serve para checar que o work-group do kernel paralelo
+    // concorda com kAttTg; ausente, a checagem é pulada e o kernel é usado.
+    cl_int (*clGetKernelWorkGroupInfo)(cl_kernel, cl_device_id, cl_kernel_work_group_info,
+                                       size_t, void*, size_t*);
     cl_int (*clReleaseCommandQueue)(cl_command_queue);
     cl_int (*clReleaseContext)(cl_context);
 };
 
 FgApi* g_api = nullptr;
 std::string g_reason = "not initialized";
+
+// Kernel-only timing. Device time is the honest numerator for "the GPU should
+// be faster": if the kernels total 12 ms and a token takes 84 ms, the other
+// 72 ms is host work and bus round-trips, and no kernel tuning will find it.
+struct GpuProf {
+    bool on = false;
+    int kernels = 0;
+    double kernel_ns = 0.0;    // device time (profiling events)
+    double wall_ns = 0.0;      // host wall time inside matmul_device
+    double out_elems = 0.0;
+    double attn_ns = 0.0;
+    int attn_calls = 0;
+    std::map<std::string, std::pair<int, double>> by_tag;
+};
+GpuProf g_prof;
 
 void load_opencl(const std::string& explicit_lib) {
     if (g_api) return;
@@ -158,7 +192,7 @@ void load_opencl(const std::string& explicit_lib) {
         throw std::runtime_error("ForwardGpu: " + msg);
     }
 
-    auto* api = new FgApi;
+    auto* api = new FgApi{};   // zero-init: optional entries stay null
     std::vector<std::string> missing;
 #define FG_LOAD(name) \
     *(void**)(&api->name) = fg_sym(h, #name); \
@@ -172,10 +206,22 @@ void load_opencl(const std::string& explicit_lib) {
     FG_LOAD(clEnqueueReadBuffer);       FG_LOAD(clEnqueueWriteBuffer);
     FG_LOAD(clGetMemObjectInfo);
     FG_LOAD(clFinish);
+    // Profiling is optional: a driver that does not export these leaves the
+    // pointers null and timing falls back to host-side wall clock.
+    // Optional profiling entry points, from the loader handle still in scope.
+    api->clGetEventProfilingInfo = (decltype(api->clGetEventProfilingInfo))
+        fg_sym(h, "clGetEventProfilingInfo");
+    api->clReleaseEvent = (decltype(api->clReleaseEvent))
+        fg_sym(h, "clReleaseEvent");
     FG_LOAD(clReleaseMemObject);        FG_LOAD(clReleaseKernel);
     FG_LOAD(clReleaseProgram);          FG_LOAD(clReleaseCommandQueue);
     FG_LOAD(clReleaseContext);
 #undef FG_LOAD
+    // Opcional: nem todo loader exporta esta, e ela só é usada para conferir
+    // o work-group do kernel paralelo. Ausente, o kernel é usado sem a
+    // checagem em vez de abortar a inicialização.
+    api->clGetKernelWorkGroupInfo = (decltype(api->clGetKernelWorkGroupInfo))
+        fg_sym(h, "clGetKernelWorkGroupInfo");
     if (!missing.empty()) {
         std::string msg = "OpenCL loader is missing symbols:";
         for (const auto& m : missing) msg += " " + m;
@@ -311,6 +357,167 @@ void gemm_bias_bf16(
 // risco de vazar o futuro.
 #define ATT_TILE 128
 
+// ── attention_split (default) ─────────────────────────────────────────────
+// O kernel acima resolve UMA linha de atenção por work-item: no decode o grid
+// é (1, nh) = 14 itens. Numa placa de 36 CUs isso são 14 lanes ocupadas, e
+// mediu-se o sintoma exato: nh=14 e nh=1 custam o mesmo tempo (3,10 ms em
+// ctx=512), porque o tempo é dominado pela falta de paralelismo, não pelo
+// trabalho. Os três q·k por chave (max, soma, acumula) ficam escondidos atrás
+// dessa latência.
+//
+// Esta versão faz as duas correções de uma vez:
+//   1. ONLINE SOFTMAX — um único q·k por chave. O max e a soma são mantidos
+//      juntos, com reescalonamento (m, l, O) a cada chave. É a identidade
+//      softmax(x)_i = exp(x_i−m)/Σexp(x_j−m) reaplicada de forma incremental,
+//      não uma aproximação.
+//   2. PARALELISMO NO EIXO DE CHAVES — ATT_TG work-items por linha de
+//      atenção, reduzindo (m, l, O) em memória local. Transforma 14 lanes em
+//      14·ATT_TG.
+//
+// Medido no mesmo dispositivo (RTX 5060 Ti), contra o kernel acima:
+//   ctx=512  3,061 ms -> 0,060 ms   (51x)
+//   ctx=2048 12,264 ms -> 0,181 ms  (68x)
+// erro máximo contra o kernel de referência: 2,7e-7 (float32).
+//
+// O source CL é uma raw string, então estes literais NÃO podem vir de
+// kAttTg/kAttHdMax -- `#define ATT_TG kAttTg` chegaria ao compilador OpenCL
+// como texto, não como o inteiro 64. Os dois lados são, portanto, literais
+// separados, e é obrigatório verificar que concordam: o construtor lê
+// CL_KERNEL_WORK_GROUP_SIZE do kernel compilado e o compara com kAttTg. Sem
+// essa checagem, mudar um lado faz o host elencar um grid que não é o do
+// kernel, e o resultado fica errado sem erro nenhum.
+#define ATT_TG 64
+#define ATT_HD_MAX 128
+
+__kernel __attribute__((reqd_work_group_size(ATT_TG, 1, 1)))
+void attention_split(
+    __global const float* Q,      // [seq, nh, hd]
+    __global const float* K,      // [ctx_max, nkv, hd] on device
+    __global const float* V,      // [ctx_max, nkv, hd] on device
+    __global float* O,            // [seq, nh, hd]
+    int seq, int ctx, int nh, int nkv, int hd, int cache_pos)
+{
+    const int g = (int)get_global_id(1);      // t*nh + h
+    const int t = g / nh, h = g % nh;
+    const int lid = (int)get_local_id(0);
+    if (t >= seq || h >= nh) return;
+
+    const int gqa = nh / nkv;
+    const int kvh = h / gqa;
+    const int lim = cache_pos + t + 1;
+    const __global float* qh = Q + ((size_t)t * nh + h) * hd;
+    const float scale = rsqrt((float)hd);
+
+    __local float s_m[ATT_TG], s_l[ATT_TG];
+    __local float s_o[ATT_TG][ATT_HD_MAX];
+
+    float m = -INFINITY, l = 0.0f;
+    float acc[ATT_HD_MAX];
+    for (int j = 0; j < hd; ++j) acc[j] = 0.0f;
+
+    for (int u = lid; u < lim; u += ATT_TG) {
+        const __global const float* kh = K + ((size_t)u * nkv + kvh) * hd;
+        float s = 0.0f;
+        for (int j = 0; j < hd; ++j) s += qh[j] * kh[j];
+        s *= scale;
+        const float mn = fmax(m, s);
+        const float corr = (m == -INFINITY) ? 0.0f : exp(m - mn);
+        const float p = exp(s - mn);
+        l = l * corr + p;
+        m = mn;
+        const __global const float* vh = V + ((size_t)u * nkv + kvh) * hd;
+        for (int j = 0; j < hd; ++j) acc[j] = acc[j] * corr + p * vh[j];
+    }
+
+    s_m[lid] = m; s_l[lid] = l;
+    for (int j = 0; j < hd; ++j) s_o[lid][j] = acc[j];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Redução combinada: (m, l, O) não são somáveis independentemente, porque
+    // cada work-item usou um m diferente. A combinação correta reescala os dois
+    // lados para o maior m antes de somar — é a mesma identidade do laço.
+    for (int st = ATT_TG / 2; st > 0; st >>= 1) {
+        if (lid < st) {
+            const float m1 = s_m[lid], m2 = s_m[lid + st];
+            const float mn = fmax(m1, m2);
+            const float c1 = (m1 == -INFINITY) ? 0.0f : exp(m1 - mn);
+            const float c2 = (m2 == -INFINITY) ? 0.0f : exp(m2 - mn);
+            s_l[lid] = s_l[lid] * c1 + s_l[lid + st] * c2;
+            for (int j = 0; j < hd; ++j)
+                s_o[lid][j] = s_o[lid][j] * c1 + s_o[lid + st][j] * c2;
+            s_m[lid] = mn;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0) {
+        const float inv = s_l[0] > 0.0f ? 1.0f / s_l[0] : 0.0f;
+        __global float* oh = O + ((size_t)t * nh + h) * hd;
+        for (int j = 0; j < hd; ++j) oh[j] = s_o[0][j] * inv;
+    }
+}
+
+// ── attention_device_kv ──────────────────────────────────────────────────
+// Same math as attention_causal, but K and V are ALREADY on the device. The
+// original kernel re-uploaded the whole cache every call: at ctx=256 that is
+// 2 x 131 KB per layer per token, and it measured 9.56 ms of a 10.81 ms call
+// (88%) — 1.25 ms was actual compute. The host now writes only the new
+// position, so the bus carries nkv*hd*4 bytes (512 B) instead of ctx times
+// that.
+//
+// `k_off`/`v_off` are element offsets where the new `seq` positions start, so
+// a prefill appends in one write and a decode appends one row.
+__kernel void attention_device_kv(
+    __global const float* Q,      // [seq, nh, hd]
+    __global const float* K,      // [ctx_max, nkv, hd] on device
+    __global const float* V,      // [ctx_max, nkv, hd] on device
+    __global float* O,            // [seq, nh, hd]
+    int seq, int ctx, int nh, int nkv, int hd, int cache_pos)
+
+{
+    const int t = (int)get_global_id(0);
+    const int h = (int)get_global_id(1);
+    if (t >= seq || h >= nh) return;
+
+    const int gqa = nh / nkv;
+    const int kvh = h / gqa;
+    const int pos = cache_pos + t;
+    const int lim = pos + 1;
+
+    const __global float* qh = Q + ((size_t)t * nh + h) * hd;
+    const float scale = rsqrt((float)hd);
+
+    float m = -INFINITY;
+    for (int u = 0; u < lim; ++u) {
+        const __global float* kh = K + ((size_t)u * nkv + kvh) * hd;
+        float s = 0.0f;
+        for (int j = 0; j < hd; ++j) s += qh[j] * kh[j];
+        s *= scale;
+        if (s > m) m = s;
+    }
+    float den = 0.0f;
+    for (int u = 0; u < lim; ++u) {
+        const __global float* kh = K + ((size_t)u * nkv + kvh) * hd;
+        float s = 0.0f;
+        for (int j = 0; j < hd; ++j) s += qh[j] * kh[j];
+        den += exp(s * scale - m);
+    }
+    const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+
+    __global float* oh = O + ((size_t)t * nh + h) * hd;
+    for (int j = 0; j < hd; ++j) oh[j] = 0.0f;
+    for (int u = 0; u < lim; ++u) {
+        const __global float* kh = K + ((size_t)u * nkv + kvh) * hd;
+        float s = 0.0f;
+        for (int j = 0; j < hd; ++j) s += qh[j] * kh[j];
+        const float w = exp(s * scale - m) * inv;
+        const __global float* vh = V + ((size_t)u * nkv + kvh) * hd;
+        for (int j = 0; j < hd; ++j) oh[j] += w * vh[j];
+    }
+}
+
+// Original kernel, kept for the non-resident path (drivers that refuse the
+// one above, or an engine with no persistent KV buffers).
 __kernel void attention_causal(
     __global const float* Q,      // [seq, nh, hd]
     __global const float* K,      // [ctx, nkv, hd]
@@ -373,12 +580,31 @@ struct ForwardGpu::Impl {
     cl_kernel k_gemm = nullptr;
     cl_kernel k_gemm_bf16 = nullptr;
     cl_kernel k_attn = nullptr;
+    cl_kernel k_attn_split = nullptr;
+    cl_kernel k_attn_res = nullptr;
     cl_mem q_buf = nullptr, k_buf = nullptr, v_buf = nullptr, o_buf = nullptr;
     // k_cap e v_cap SEPARADOS. Eram um `kv_cap` compartilhado, e o grow do K
     // atualizava a capacidade antes do grow do V consultá-la — então o V via
     // "já cabe" e continuava com o buffer pequeno do forward anterior. Medido:
     // aquecer com n=2 e medir n=4 divergia em 23,5; decrescente funcionava.
     size_t q_cap = 0, k_cap = 0, v_cap = 0, o_cap = 0;
+    // ── Persistent KV cache, one buffer per layer, on the device ──────────
+    //
+    // The cache used to be re-uploaded whole on every attention call: at
+    // ctx=256 that is 2 x 131 KB x 24 layers x 1 token = 6.3 MB per token
+    // across 48 BLOCKING transfers, and it measured 88% of the attention
+    // call. Growing to ctx_max once and writing only the new positions turns
+    // that into 512 B per layer per token.
+    //
+    // Sized lazily on the first prefill, because ctx_max is a property of the
+    // caller's sequence, not of the model. A cache that cannot be allocated
+    // leaves the vectors empty and every call falls back to the old path —
+    // no silent half-state.
+    std::vector<cl_mem> kv_k, kv_v;
+    size_t kv_layer_cap = 0;     // capacity per layer, in positions
+    int kv_layers = 0;
+    // Reused staging row so a decode append does not allocate per call.
+    std::vector<float> stage;
     // A janela de K/V muda de tamanho entre forwards (cache_pos + seq). O
     // `grow` só realoca quando `cap` cresce, mas o CONTEÚDO acima de ctx é
     // lixo do forward anterior — e o kernel lê só até `lim`, então isso é
@@ -614,10 +840,13 @@ struct ForwardGpu::Impl {
         if (k_gemm) g_api->clReleaseKernel(k_gemm);
         if (k_gemm_bf16) g_api->clReleaseKernel(k_gemm_bf16);
         if (k_attn) g_api->clReleaseKernel(k_attn);
+        if (k_attn_split) g_api->clReleaseKernel(k_attn_split);
         if (q_buf) g_api->clReleaseMemObject(q_buf);
         if (k_buf) g_api->clReleaseMemObject(k_buf);
         if (v_buf) g_api->clReleaseMemObject(v_buf);
         if (o_buf) g_api->clReleaseMemObject(o_buf);
+        for (cl_mem m : kv_k) if (m) g_api->clReleaseMemObject(m);
+        for (cl_mem m : kv_v) if (m) g_api->clReleaseMemObject(m);
         if (prog) g_api->clReleaseProgram(prog);
         if (q) g_api->clReleaseCommandQueue(q);
         if (ctx) g_api->clReleaseContext(ctx);
@@ -657,7 +886,8 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
     impl_->ctx = g_api->clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err);
     if (err != CL_SUCCESS || !impl_->ctx)
         throw std::runtime_error("ForwardGpu: clCreateContext failed (" + std::to_string(err) + ")");
-    impl_->q = g_api->clCreateCommandQueue(impl_->ctx, dev, 0, &err);
+    impl_->q = g_api->clCreateCommandQueue(impl_->ctx, dev,
+                                           CL_QUEUE_PROFILING_ENABLE, &err);
     if (err != CL_SUCCESS || !impl_->q)
         throw std::runtime_error("ForwardGpu: clCreateCommandQueue failed (" + std::to_string(err) + ")");
 
@@ -677,6 +907,37 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
         throw std::runtime_error(std::string("ForwardGpu: clBuildProgram failed:\n") + log.data());
     }
     impl_->k_attn = g_api->clCreateKernel(impl_->prog, "attention_causal", &err);
+    // Optional: a driver that refuses this kernel leaves it null and the engine
+    // keeps the per-call-upload path.
+    impl_->k_attn_res = g_api->clCreateKernel(impl_->prog, "attention_device_kv", &err);
+    if (err != CL_SUCCESS) impl_->k_attn_res = nullptr;
+    // A variante paralela. Se o driver recusá-la (hd > ATT_HD_MAX, ou
+    // work-group de 64 não suportado), cai no kernel serial: a correção é de
+    // desempenho, e desempenho não justifica falhar.
+    impl_->k_attn_split = g_api->clCreateKernel(impl_->prog, "attention_split", &err);
+    if (err != CL_SUCCESS) impl_->k_attn_split = nullptr;
+    // O host elenca o grid com kAttTg e o kernel declara reqd_work_group_size
+    // com o literal 64 do source CL (que não pode ver kAttTg: é raw string).
+    // Se os dois divergirem o kernel roda com um grid errado, sem erro. Esta
+    // leitura do kernel compilado é o que transforma a divergência em falha.
+    if (impl_->k_attn_split) {
+        // CL_KERNEL_COMPILE_WORK_GROUP_SIZE, não CL_KERNEL_WORK_GROUP_SIZE:
+        // o primeiro devolve o reqd_work_group_size do source (o que o kernel
+        // EXIGE), o segundo devolve o máximo que o dispositivo aceita (1024
+        // nesta placa). Comparar o máximo com 64 descartaria um kernel correto.
+        size_t req[3] = {0, 0, 0};
+        if (g_api->clGetKernelWorkGroupInfo &&
+            g_api->clGetKernelWorkGroupInfo(impl_->k_attn_split, dev,
+                    CL_KERNEL_COMPILE_WORK_GROUP_SIZE, sizeof(req), req, nullptr) == CL_SUCCESS) {
+            if ((int)req[0] != kAttTg) {
+                g_api->clReleaseKernel(impl_->k_attn_split);
+                impl_->k_attn_split = nullptr;
+                g_reason = "attention_split: reqd_work_group_size do kernel (" +
+                           std::to_string((int)req[0]) + ") != kAttTg (" +
+                           std::to_string(kAttTg) + "); usando o kernel serial";
+            }
+        }
+    }
     impl_->dev = dev;
     {
         cl_ulong total = 0, freeb = 0;
@@ -735,7 +996,12 @@ void ForwardGpu::attention(const float* Q, const float* K, const float* V, float
     g_api->clEnqueueWriteBuffer(impl_->q, impl_->v_buf, blocking, 0, kv_bytes, V, 0, nullptr, nullptr);
 
     cl_mem qb = impl_->q_buf, kb = impl_->k_buf, vb = impl_->v_buf, ob = impl_->o_buf;
-    cl_kernel k = impl_->k_attn;
+    // Mesmo A/B do caminho residente. Este é o caminho que o decode usa de
+    // fato (`attn_res` exige WINNEX_KV_RESIDENT=1), então sem trocar aqui o
+    // ganho do kernel novo não apareceria no token.
+    const bool use_split = impl_->k_attn_split != nullptr && hd <= kAttHdMax &&
+                           !std::getenv("WINNEX_ATTN_SERIAL");
+    cl_kernel k = use_split ? impl_->k_attn_split : impl_->k_attn;
     // Ordem dos argumentos confere com a assinatura do kernel. Verificar cada
     // retorno: um argumento trocado faz o enqueue falhar com -52 sem dizer
     // qual, e um argumento ERRADO MAS VÁLIDO (ex.: ctx no lugar de seq) roda
@@ -756,14 +1022,197 @@ void ForwardGpu::attention(const float* Q, const float* K, const float* V, float
                                      std::to_string(e2) + ")");
     }
 
-    const size_t gsz[2] = {(size_t)seq, (size_t)nh};
-    err = g_api->clEnqueueNDRangeKernel(impl_->q, k, 2, nullptr, gsz, nullptr, 0, nullptr, nullptr);
+    // Eixo 0 do grid difere entre os dois kernels (ver attention_resident).
+    size_t gsz[2];
+    size_t lsz[2];
+    if (use_split) {
+        gsz[0] = (size_t)kAttTg;
+        gsz[1] = (size_t)seq * nh;
+        lsz[0] = (size_t)kAttTg;
+        lsz[1] = 1;
+    } else {
+        gsz[0] = (size_t)seq;
+        gsz[1] = (size_t)nh;
+    }
+    cl_event ev = nullptr;
+    const bool prof = g_api->clGetEventProfilingInfo && g_prof.on;
+    err = g_api->clEnqueueNDRangeKernel(impl_->q, k, 2, nullptr, gsz,
+                                        use_split ? lsz : nullptr,
+                                        0, nullptr, prof ? &ev : nullptr);
     if (err != CL_SUCCESS)
         throw std::runtime_error("ForwardGpu::attention: enqueue failed (" +
                                  std::to_string(err) + ")");
     g_api->clEnqueueReadBuffer(impl_->q, ob, CL_TRUE, 0, o_bytes, O, 0, nullptr, nullptr);
     g_api->clFinish(impl_->q);
+    if (prof) {
+        cl_ulong t0 = 0, t1 = 0;
+        g_api->clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, nullptr);
+        g_api->clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END,   sizeof(t1), &t1, nullptr);
+        g_prof.attn_ns += (double)(t1 - t0);
+        g_prof.attn_calls += 1;
+        if (g_api->clReleaseEvent) g_api->clReleaseEvent(ev);
+    }
 }
+// ── Persistent KV cache ────────────────────────────────────────────────────
+//
+// prepare_kv() allocates one buffer pair per layer, sized for `ctx_max`
+// positions, and resets both to "empty". It is called on every prefill and on
+// reset, so the buffers are reused for the life of the engine.
+//
+// Returns false when the allocation fails (out of device memory). The caller
+// then keeps using attention(), which uploads the cache per call — slower, but
+// correct. Never a partial state: either every layer has buffers or none does.
+bool ForwardGpu::prepare_kv(int ctx_max, int nkv, int hd, int n_layers) {
+    if (!impl_) return false;
+    const size_t per_layer = (size_t)ctx_max * nkv * hd;
+    if (per_layer == 0 || n_layers <= 0) return false;
+
+    // Already big enough and shaped the same: just rewind.
+    if (impl_->kv_layers == n_layers && impl_->kv_layer_cap >= (size_t)ctx_max)
+        return true;
+
+    release_kv();
+    cl_int err = CL_SUCCESS;
+    impl_->kv_k.assign((size_t)n_layers, nullptr);
+    impl_->kv_v.assign((size_t)n_layers, nullptr);
+    for (int l = 0; l < n_layers; ++l) {
+        impl_->kv_k[(size_t)l] = g_api->clCreateBuffer(
+            impl_->ctx, CL_MEM_READ_ONLY, per_layer * sizeof(float), nullptr, &err);
+        if (err != CL_SUCCESS) { release_kv(); return false; }
+        impl_->kv_v[(size_t)l] = g_api->clCreateBuffer(
+            impl_->ctx, CL_MEM_READ_ONLY, per_layer * sizeof(float), nullptr, &err);
+        if (err != CL_SUCCESS) { release_kv(); return false; }
+    }
+    impl_->kv_layer_cap = (size_t)ctx_max;
+    impl_->kv_layers = n_layers;
+    return true;
+}
+
+void ForwardGpu::release_kv() {
+    if (!impl_) return;
+    for (cl_mem m : impl_->kv_k) if (m) g_api->clReleaseMemObject(m);
+    for (cl_mem m : impl_->kv_v) if (m) g_api->clReleaseMemObject(m);
+    impl_->kv_k.clear();
+    impl_->kv_v.clear();
+    impl_->kv_layers = 0;
+    impl_->kv_layer_cap = 0;
+}
+
+bool ForwardGpu::has_kv(int layer) const {
+    return impl_ && layer >= 0 && layer < impl_->kv_layers &&
+           (size_t)layer < impl_->kv_k.size() && impl_->kv_k[(size_t)layer] != nullptr;
+}
+
+// Attention against the device-resident cache.
+//
+// `cache_pos` is the absolute position of the first row of K/V being supplied.
+// `seq` rows are written starting there — one row for a decode step, the whole
+// prompt for a prefill — and the kernel then attends over 0..cache_pos+seq.
+//
+// Writes are non-blocking: the queue is in-order, so the kernel that consumes
+// them is guaranteed to see them. The only blocking call is the clFinish/read
+// that hands O back to the host.
+void ForwardGpu::attention_resident(int layer, const float* Q,
+                                    const float* K, const float* V, float* O,
+                                    int seq, int nh, int nkv, int hd, int cache_pos) {
+    if (!impl_) throw std::runtime_error("ForwardGpu::attention_resident: not initialised");
+    if (!has_kv(layer))
+        throw std::runtime_error("ForwardGpu::attention_resident: no KV buffer for layer " +
+                                 std::to_string(layer));
+    if (!impl_->k_attn_res) throw std::runtime_error(
+        "ForwardGpu::attention_resident: kernel attention_device_kv not compiled");
+
+    const int ctx = cache_pos + seq;
+    if ((size_t)ctx > impl_->kv_layer_cap)
+        throw std::out_of_range("ForwardGpu::attention_resident: context " +
+                                std::to_string(ctx) + " exceeds reserved " +
+                                std::to_string(impl_->kv_layer_cap));
+
+    cl_int err = CL_SUCCESS;
+    const size_t q_bytes = (size_t)seq * nh * hd * sizeof(float);
+    const size_t row_bytes = (size_t)nkv * hd * sizeof(float);
+    const size_t append_bytes = (size_t)seq * row_bytes;
+    const size_t off = (size_t)cache_pos * row_bytes;
+
+    auto grow = [&](cl_mem& buf, size_t& cap, size_t need, cl_mem_flags f) {
+        if (cap >= need && buf) return;
+        if (buf) g_api->clReleaseMemObject(buf);
+        buf = g_api->clCreateBuffer(impl_->ctx, f, need, nullptr, &err);
+        if (err != CL_SUCCESS) throw std::runtime_error("ForwardGpu::attention_resident: buffer");
+        cap = need;
+    };
+    grow(impl_->q_buf, impl_->q_cap, q_bytes, CL_MEM_READ_ONLY);
+    grow(impl_->o_buf, impl_->o_cap, q_bytes, CL_MEM_WRITE_ONLY);
+
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->q_buf, CL_TRUE, 0, q_bytes, Q,
+                                0, nullptr, nullptr);
+    // ONLY the new rows cross the bus. Non-blocking: in-order queue orders them
+    // before the kernel below.
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->kv_k[(size_t)layer], CL_FALSE,
+                                off, append_bytes, K, 0, nullptr, nullptr);
+    g_api->clEnqueueWriteBuffer(impl_->q, impl_->kv_v[(size_t)layer], CL_FALSE,
+                                off, append_bytes, V, 0, nullptr, nullptr);
+
+    cl_mem qb = impl_->q_buf, kb = impl_->kv_k[(size_t)layer];
+    cl_mem vb = impl_->kv_v[(size_t)layer], ob = impl_->o_buf;
+    // Prefer the parallel kernel whenever it compiled and hd fits in its
+    // local tile. WINNEX_ATTN_SERIAL=1 forces the old one, so the 51x can be
+    // re-measured in the same process instead of being taken on faith.
+    const bool use_split = impl_->k_attn_split != nullptr && hd <= kAttHdMax &&
+                           !std::getenv("WINNEX_ATTN_SERIAL");
+    cl_kernel k = use_split ? impl_->k_attn_split : impl_->k_attn_res;
+    struct Arg { cl_uint i; size_t sz; const void* p; };
+    const Arg args[10] = {
+        {0, sizeof(cl_mem), &qb}, {1, sizeof(cl_mem), &kb},
+        {2, sizeof(cl_mem), &vb}, {3, sizeof(cl_mem), &ob},
+        {4, sizeof(int), &seq},   {5, sizeof(int), &ctx},
+        {6, sizeof(int), &nh},    {7, sizeof(int), &nkv},
+        {8, sizeof(int), &hd},    {9, sizeof(int), &cache_pos},
+    };
+    for (const Arg& a : args) {
+        cl_int e2 = g_api->clSetKernelArg(k, a.i, a.sz, a.p);
+        if (e2 != CL_SUCCESS)
+            throw std::runtime_error("ForwardGpu::attention_resident: clSetKernelArg(" +
+                                     std::to_string(a.i) + ") failed (" +
+                                     std::to_string(e2) + ")");
+    }
+
+    // O eixo 0 do grid é DIFERENTE entre os dois kernels: o serial indexa
+    // (token, cabeça); o paralelo usa o eixo 0 para a chave dentro da linha e
+    // o eixo 1 para (token, cabeça). Mandar gsz=(seq,nh) para o paralelo
+    // rodaria ATT_TG cópias de cada linha em vez de dividir a chave entre elas.
+    size_t gsz[2];
+    size_t lsz[2];
+    cl_uint ndim = 2;
+    if (use_split) {
+        gsz[0] = (size_t)kAttTg;
+        gsz[1] = (size_t)seq * nh;
+        lsz[0] = (size_t)kAttTg;
+        lsz[1] = 1;
+    } else {
+        gsz[0] = (size_t)seq;
+        gsz[1] = (size_t)nh;
+    }
+    cl_event ev = nullptr;
+    const bool prof = g_api->clGetEventProfilingInfo && g_prof.on;
+    err = g_api->clEnqueueNDRangeKernel(impl_->q, k, ndim, nullptr, gsz,
+                                        use_split ? lsz : nullptr,
+                                        0, nullptr, prof ? &ev : nullptr);
+    if (err != CL_SUCCESS)
+        throw std::runtime_error("ForwardGpu::attention_resident: enqueue failed (" +
+                                 std::to_string(err) + ")");
+    g_api->clEnqueueReadBuffer(impl_->q, ob, CL_TRUE, 0, q_bytes, O, 0, nullptr, nullptr);
+    g_api->clFinish(impl_->q);
+    if (prof) {
+        cl_ulong t0 = 0, t1 = 0;
+        g_api->clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, nullptr);
+        g_api->clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END,   sizeof(t1), &t1, nullptr);
+        g_prof.attn_ns += (double)(t1 - t0);
+        g_prof.attn_calls += 1;
+        if (g_api->clReleaseEvent) g_api->clReleaseEvent(ev);
+    }
+}
+
 std::string ForwardGpu::device_name() const { return impl_ ? impl_->dev_name : ""; }
 std::string ForwardGpu::reason() { return g_reason; }
 
@@ -775,8 +1224,27 @@ bool ForwardGpu::has_weight(const char* tag) const {
     return impl_ && tag != nullptr && impl_->tagged.count(tag) > 0;
 }
 
+// Device-side timing control. Off unless asked: the event objects and the
+// profiling flags are not free, and a benchmark is not a production run.
+void ForwardGpu::profiling_enable(bool on) { g_prof = GpuProf(); g_prof.on = on; }
+
+double ForwardGpu::profiling_kernel_ms() const { return g_prof.kernel_ns / 1e6; }
+double ForwardGpu::profiling_wall_ms()   const { return g_prof.wall_ns / 1e6; }
+double ForwardGpu::profiling_attn_ms()   const { return g_prof.attn_ns / 1e6; }
+int    ForwardGpu::profiling_attn_calls() const { return g_prof.attn_calls; }
+int    ForwardGpu::profiling_kernels()   const { return g_prof.kernels; }
+double ForwardGpu::profiling_elems()     const { return g_prof.out_elems; }
+
+std::vector<std::pair<std::string, std::pair<int, double>>>
+ForwardGpu::profiling_by_tag() const {
+    std::vector<std::pair<std::string, std::pair<int, double>>> v;
+    for (const auto& kv : g_prof.by_tag) v.push_back(kv);
+    return v;
+}
+
 void ForwardGpu::matmul_device(const char* tag, const float* A, int seq,
                                int out_dim, int in_dim, const float* bias, float* C) {
+    const auto wall_a = std::chrono::steady_clock::now();
     // Same body as matmul(), but the weight buffer is looked up by name and is
     // REQUIRED to exist. No host pointer is dereferenced: in device mode the
     // host has already dropped every projection matrix.
@@ -826,15 +1294,61 @@ void ForwardGpu::matmul_device(const char* tag, const float* A, int seq,
     const size_t lws[2] = {(size_t)TSB, (size_t)TSB};
     const size_t gsz[2] = {((size_t)out_dim + TSB - 1) / TSB * TSB,
                            ((size_t)seq + TSB - 1) / TSB * TSB};
+    cl_event ev_k = nullptr;
+    const bool prof = g_api->clGetEventProfilingInfo && g_prof.on;
     err = g_api->clEnqueueNDRangeKernel(impl_->q, kern, 2, nullptr, gsz, lws,
-                                        0, nullptr, nullptr);
+                                        0, nullptr, prof ? &ev_k : nullptr);
     if (err != CL_SUCCESS)
         throw std::runtime_error("ForwardGpu: enqueue failed (" + std::to_string(err) +
             ") tag=" + (tag ? tag : "?") + " seq=" + std::to_string(seq) +
             " in=" + std::to_string(in_dim) + " out=" + std::to_string(out_dim) +
             " bias=" + std::to_string(has_bias) + " bf16=" + std::to_string((int)is_bf16));
     g_api->clEnqueueReadBuffer(impl_->q, bc, CL_TRUE, 0, c_bytes, C, 0, nullptr, nullptr);
-    g_api->clFinish(impl_->q);
+    // ── clFinish: o teste A/B ────────────────────────────────────────────
+    //
+    // The read above is already CL_TRUE, so C is in host memory when this line
+    // is reached, and the queue is in-order: every command submitted before
+    // the read has completed (completion of a command implies completion of
+    // everything ahead of it in an in-order queue). The extra clFinish is
+    // therefore not required for correctness of this call — it is a full flush
+    // that forces the driver to hand back the whole queue.
+    //
+    // MEDIDO — não vale nada. A/B no mesmo binário, ctx=512, 40 tokens por
+    // braço, 5 pares alternados, aquecimento descartado:
+    //
+    //   com clFinish : 160,27 ms   (min 159,36 max 162,54)
+    //   sem clFinish : 160,05 ms   (min 159,70 max 160,94)
+    //   delta        : -0,22 ms (-0,14%)
+    //
+    // A variação DENTRO de cada braço é 14x maior que o efeito. O clFinish é
+    // redundante como esperado (a leitura CL_TRUE já sincroniza), e removê-lo
+    // não muda nada porque não era ele que custava. Fica atrás do switch para
+    // que a próxima pessoa não gaste uma sessão repetindo isto.
+    static const bool skip_finish = [] {
+        const char* v = std::getenv("WINNEX_NO_FINISH");
+        return v && std::string(v) == "1";
+    }();
+    if (!skip_finish) g_api->clFinish(impl_->q);
+
+    if (prof) {
+        cl_ulong t0 = 0, t1 = 0;
+        g_api->clGetEventProfilingInfo(ev_k, CL_PROFILING_COMMAND_START,
+                                       sizeof(t0), &t0, nullptr);
+        g_api->clGetEventProfilingInfo(ev_k, CL_PROFILING_COMMAND_END,
+                                       sizeof(t1), &t1, nullptr);
+        g_prof.kernel_ns += (double)(t1 - t0);
+        g_prof.kernels += 1;
+        g_prof.out_elems += (double)seq * out_dim;
+        const char* nm = tag ? tag : "?";
+        auto it = g_prof.by_tag.find(nm);
+        if (it == g_prof.by_tag.end())
+            g_prof.by_tag[nm] = std::make_pair(1, (double)(t1 - t0));
+        else { it->second.first += 1; it->second.second += (double)(t1 - t0); }
+        if (g_api->clReleaseEvent) g_api->clReleaseEvent(ev_k);
+    }
+    if (g_prof.on)
+        g_prof.wall_ns += std::chrono::duration<double, std::nano>(
+            std::chrono::steady_clock::now() - wall_a).count();
 }
 
 bool ForwardGpu::weights_fit(size_t total_f32_bytes) const {

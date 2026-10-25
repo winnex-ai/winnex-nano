@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <omp.h>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -128,6 +130,52 @@ ModelConfig load_config(const std::string& config_path) {
     c.sliding_window = find_int("sliding_window", 0);
     c.has_sliding_window = c.sliding_window > 0;
 
+    // rope_scaling: o parser é de chave plana e `rope_scaling` é um objeto
+    // aninhado. Procura-se dentro DELE, não no arquivo inteiro -- procurar
+    // "factor" no config todo casaria `rope_scaling.factor` e também qualquer
+    // outro `factor` que o checkpoint traga (vision_config, quant config).
+    c.rope_type = "";
+    c.rope_factor = 1.0f;
+    {
+        size_t rs = s.find("\"rope_scaling\"");
+        if (rs != std::string::npos) {
+            size_t open = s.find('{', rs);
+            size_t close = (open == std::string::npos) ? std::string::npos
+                                                       : s.find('}', open);
+            if (open != std::string::npos && close != std::string::npos) {
+                std::string body = s.substr(open, close - open + 1);
+                auto sub_float = [&](const char* key, float def) -> float {
+                    std::string pat = std::string("\"") + key + "\"";
+                    size_t p = body.find(pat);
+                    if (p == std::string::npos) return def;
+                    p = body.find(':', p);
+                    if (p == std::string::npos) return def;
+                    return (float)std::atof(body.c_str() + p + 1);
+                };
+                auto sub_str = [&](const char* key) -> std::string {
+                    std::string pat = std::string("\"") + key + "\"";
+                    size_t p = body.find(pat);
+                    if (p == std::string::npos) return "";
+                    p = body.find(':', p);
+                    if (p == std::string::npos) return "";
+                    size_t q = body.find('"', p);
+                    if (q == std::string::npos) return "";
+                    size_t e = body.find('"', q + 1);
+                    if (e == std::string::npos) return "";
+                    return body.substr(q + 1, e - q - 1);
+                };
+                // "type" é o nome antigo do campo em alguns checkpoints.
+                c.rope_type = sub_str("rope_type");
+                if (c.rope_type.empty()) c.rope_type = sub_str("type");
+                c.rope_factor = sub_float("factor", 1.0f);
+                c.rope_low_freq_factor = sub_float("low_freq_factor", 1.0f);
+                c.rope_high_freq_factor = sub_float("high_freq_factor", 4.0f);
+                c.rope_original_max_pos =
+                    find_int("original_max_position_embeddings", 0);
+            }
+        }
+    }
+
     // ── DEFAULTS QUE INVENTAM VALORES SÃO FALSOS NEGATIVOS ────────────────
     //
     // These fields used to have plausible defaults: max_position_embeddings
@@ -189,6 +237,25 @@ ModelConfig load_config(const std::string& config_path) {
             "trained to ignore. (A window >= max_position_embeddings is inert "
             "and is accepted.)");
     }
+
+    // ── rope_scaling: implementado até onde é implementado ────────────────
+    //
+    // "llama3" é o caso real (Llama-3.1/3.2): as frequências BAIXAS são
+    // divididas por `factor`, as altas ficam, e há uma transição suave entre
+    // elas. É implementado abaixo em run_layer.
+    //
+    // Qualquer outro tipo ("linear", "dynamic", "yarn", "longrope", ...) muda
+    // a função posicional de uma forma que este código não calcula. Ignorá-lo
+    // é a mesma classe de defeito que o motor já corrigiu em `rope_theta` e em
+    // `sliding_window`: rodar um modelo diferente sem avisar. Recusa.
+    if (!c.rope_type.empty() && c.rope_type != "llama3") {
+        throw std::runtime_error(
+            "ForwardEngine: rope_scaling.rope_type='" + c.rope_type +
+            "' is not implemented. Supported: llama3 (and no scaling at all). "
+            "Other types change the positional function in a way this engine "
+            "does not compute — running them would produce fluent, wrong text "
+            "with no indication of the difference.");
+    }
     // HEAD_DIM: prefer the explicit value from config.json, fall back to
     // hidden/heads only when it is absent.
     //
@@ -222,6 +289,10 @@ struct ForwardEngine::LayerWeights {
     // QKV BIASES (see the BUG FIX note in load_layer). Qwen2/Qwen2.5 carry
     // attention biases; Llama does not. Empty when the checkpoint has none.
     std::vector<float> q_b, k_b, v_b;
+    // The three above concatenated [q_out | kv_out | kv_out] for the fused QKV
+    // GEMM. Empty when the checkpoint has no biases at all, which is how the
+    // fused path decides whether to pass one to the kernel.
+    std::vector<float> qkv_b;
     // PER-HEAD Q/K RMSNorm (Qwen3). Applied over head_dim on each head of Q
     // and K BEFORE RoPE. Empty for architectures that do not use it.
     std::vector<float> q_norm, k_norm;
@@ -266,6 +337,11 @@ ForwardEngine::ForwardEngine(const ModelConfig& cfg, const Safetensors& st)
             inter * H * 2 + H * inter;           // gate + up + down
         param_count_ += per_layer * (size_t)cfg_.num_hidden_layers;
     }
+
+    // Decide the CPU weight strategy NOW, not when (or if) a GPU is enabled.
+    // This is the fix for the 0.27 tok/s CPU path: the decision was correct and
+    // lived in a function a CPU-only caller never calls.
+    decide_cpu_residency();
 }
 
 namespace {
@@ -389,6 +465,17 @@ void ForwardEngine::load_layer(int layer, LayerWeights& w) {
     load_bias(L + "self_attn.q_proj", w.q_b);
     load_bias(L + "self_attn.k_proj", w.k_b);
     load_bias(L + "self_attn.v_proj", w.v_b);
+    // Fused QKV bias, same rule as load_layer_shallow: only when all three are
+    // present and sized as expected; otherwise qkv_proj is simply not pushed
+    // and run_layer takes the three-kernel path.
+    w.qkv_b.clear();
+    if (w.q_b.size() == (size_t)w.q_out && w.k_b.size() == (size_t)w.kv_out &&
+        w.v_b.size() == (size_t)w.kv_out) {
+        w.qkv_b.reserve(w.q_out + 2 * w.kv_out);
+        w.qkv_b.insert(w.qkv_b.end(), w.q_b.begin(), w.q_b.end());
+        w.qkv_b.insert(w.qkv_b.end(), w.k_b.begin(), w.k_b.end());
+        w.qkv_b.insert(w.qkv_b.end(), w.v_b.begin(), w.v_b.end());
+    }
 
     w.g_w = load_dense_or_gptq_scales(*st_, L + "mlp.gate_proj", is_gptq);
     w.u_w = load_dense_or_gptq_scales(*st_, L + "mlp.up_proj",   is_gptq);
@@ -427,19 +514,127 @@ void ForwardEngine::load_layer_shallow(int layer, LayerWeights& w) {
     load_bias(L + "self_attn.q_proj", w.q_b);
     load_bias(L + "self_attn.k_proj", w.k_b);
     load_bias(L + "self_attn.v_proj", w.v_b);
+    // Fused QKV bias: only when all three are present and sized as expected.
+    // A partial set cannot be folded into the single [out_dim] kernel arg, and
+    // the run_layer fallback handles the three-kernel case.
+    w.qkv_b.clear();
+    if (w.q_b.size() == (size_t)w.q_out && w.k_b.size() == (size_t)w.kv_out &&
+        w.v_b.size() == (size_t)w.kv_out) {
+        w.qkv_b.reserve(w.q_out + 2 * w.kv_out);
+        w.qkv_b.insert(w.qkv_b.end(), w.q_b.begin(), w.q_b.end());
+        w.qkv_b.insert(w.qkv_b.end(), w.k_b.begin(), w.k_b.end());
+        w.qkv_b.insert(w.qkv_b.end(), w.v_b.begin(), w.v_b.end());
+    }
     w.loaded = true;
+}
+
+// ── OpenMP thread cap ──────────────────────────────────────────────────────
+//
+// dense_matmul opens an omp parallel region PER CALL, and the engine makes
+// hundreds of calls per token (the lm_head alone used to make 297). On a host
+// with other work, the default "use every core" turns into oversubscription and
+// the engine collapses. Measured, Qwen2.5-0.5B, 32-token prefill, this build:
+//
+//     OMP=  1 :  1.40 s  ( 22.8 tok/s)
+//     OMP=  2 :  0.86 s  ( 37.3 tok/s)
+//     OMP=  4 :  0.61 s  ( 52.6 tok/s)   <- optimum
+//     OMP=  8 :  0.83 s  ( 38.6 tok/s)
+//     OMP= 16 :  0.79 s  ( 40.8 tok/s)
+//     OMP= 28 : 90.35 s  (  0.4 tok/s)   <- 148x collapse
+//
+// Four threads beating twenty-eight is not a typo: each region launch costs a
+// barrier, and with 28 threads the barriers dominate the 4864-wide rows.
+//
+// So: cap at the measured optimum unless the caller asks otherwise. An explicit
+// OMP_NUM_THREADS is always honoured — the sweep above is reproducible that way,
+// and a caller with a dedicated machine may legitimately want more.
+namespace {
+struct ThreadCap {
+    ThreadCap() {
+        if (std::getenv("OMP_NUM_THREADS") != nullptr) return;  // caller decides
+        omp_set_num_threads(4);
+    }
+};
+ThreadCap g_thread_cap;
+}  // namespace
+
+// ── Phase timers ───────────────────────────────────────────────────────────
+// Decode was measured at 84 ms/token with only 22% of it in GPU kernels. The
+// remaining 78% is host work, and guessing which part (idle hypotheses tested
+// and refuted: KV-cache resize 0.08 ms, shallow reload 0.09 ms, dense_matmul
+// 6.6 ms) is how a week disappears. Enabled by WINNEX_PHASE_TIMERS=1.
+namespace {
+struct PhaseTimers {
+    bool on = std::getenv("WINNEX_PHASE_TIMERS") != nullptr;
+    double rms = 0, rope = 0, attn = 0, attn_gpu = 0, resid = 0, mlp_epi = 0, lmh = 0;
+    int n = 0;
+    ~PhaseTimers() {
+        if (!on || n == 0) return;
+        std::fprintf(stderr,
+            "[phase] n=%d  rms=%.2f rope=%.2f attn=%.2f (gpu=%.2f) resid=%.2f "
+            "mlp_epi=%.2f lm_head=%.2f  (total=%.2f ms/token)\n",
+            n, rms / n, rope / n, attn / n, attn_gpu / n, resid / n, mlp_epi / n, lmh / n,
+            (rms + rope + attn + resid + mlp_epi + lmh) / n);
+    }
+};
+PhaseTimers g_phase;
+struct ScopedTimer {
+    PhaseTimers& t; double& slot; bool on; std::chrono::steady_clock::time_point a;
+    ScopedTimer(PhaseTimers& tt, double& s, bool o)
+      : t(tt), slot(s), on(o), a(std::chrono::steady_clock::now()) {}
+    ~ScopedTimer() {
+        if (on) slot += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - a).count();
+    }
+};
+}  // namespace
+
+float ForwardEngine::RoPEInvFreq(int j) const {
+    const int hd = cfg_.head_dim;
+    const float base = std::pow(cfg_.rope_theta, -2.0f * j / (float)hd);
+    if (cfg_.rope_type != "llama3") return base;
+
+    // llama3 RoPE. Porta fiel de modeling_rope_utils._compute_llama3_parameters:
+    // as duas metades (frequência alta e baixa) usam `inv_freq` DIFERENTES, e a
+    // transição é uma interpolação, não um corte. A versão anterior deste
+    // código não existia — `rope_scaling` era ignorado — e no Llama-3.2 isso
+    // deixava 15 das 32 dimensões com a invariante errada por um fator de 32.
+    const double theta = (double)cfg_.rope_theta;
+    const double inv = std::pow(theta, -2.0 * j / (double)hd);
+    const double factor = (double)cfg_.rope_factor;
+    const double lo_f = (double)cfg_.rope_low_freq_factor;
+    const double hi_f = (double)cfg_.rope_high_freq_factor;
+    const double old_ctx = (double)(cfg_.rope_original_max_pos > 0
+                                    ? cfg_.rope_original_max_pos
+                                    : cfg_.max_position_embeddings);
+    const double low_wavelen = old_ctx / lo_f;
+    const double high_wavelen = old_ctx / hi_f;
+    const double wavelen = 2.0 * M_PI / inv;
+
+    double inv_llama = (wavelen > low_wavelen) ? inv / factor : inv;
+    if (!(wavelen < high_wavelen) && !(wavelen > low_wavelen)) {
+        // Faixa de transição. O sinal do smooth_factor é o do código oficial:
+        // (old_ctx/wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor).
+        const double smooth = (old_ctx / wavelen - lo_f) / (hi_f - lo_f);
+        inv_llama = (1.0 - smooth) * (inv_llama / factor) + smooth * inv_llama;
+    }
+    return (float)inv_llama;
 }
 
 void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
                               std::vector<float>& k_cache, std::vector<float>& v_cache,
                               int cache_pos) {
-    // GPU path uses the RESIDENT copy so the weight pointers are stable across
-    // calls and the device-side cache hits. The CPU path keeps the historical
-    // per-call load (it costs nothing measurable and avoids holding every
-    // layer's weights in RAM when no GPU is in use).
+    // Both paths prefer the RESIDENT copy when there is one.
+    //
+    // The comment here used to say the CPU path "keeps the historical per-call
+    // load (it costs nothing measurable)". That was wrong, and it was the whole
+    // CPU bottleneck: load_layer() re-reads seven matrices from the checkpoint
+    // per layer, per token. Measured on the published 0.1.34 wheel: 0.25 tok/s
+    // on a 32-token prefill.
     LayerWeights w_scratch;
-    LayerWeights& w = (gpu_ != nullptr && layer < (int)resident_.size())
-                        ? *resident_[layer] : w_scratch;
+    const bool can_resident = layer < (int)resident_.size() &&
+                              resident_[(size_t)layer] != nullptr;
+    LayerWeights& w = can_resident ? *resident_[(size_t)layer] : w_scratch;
     if (&w == &w_scratch) {
         if (device_weights_) load_layer_shallow(layer, w);
         else                 load_layer(layer, w);
@@ -449,7 +644,8 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
 
     // 1. Input layernorm (RMSNorm).
     std::vector<float> hn(H * seq_len);
-    rms_norm(hn.data(), h.data(), w.in_norm.data(), seq_len, H, cfg_.rms_norm_eps);
+    { ScopedTimer _t(g_phase, g_phase.rms, g_phase.on && seq_len == 1);
+      rms_norm(hn.data(), h.data(), w.in_norm.data(), seq_len, H, cfg_.rms_norm_eps); }
 
     // 2. QKV projections (dense f32) — batched as (seq*H).
     std::vector<float> q(seq_len * w.q_out), k(seq_len * w.kv_out), v(seq_len * w.kv_out);
@@ -469,6 +665,41 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
         // the only way the 7B gets GPU speed at all (13.1 GB bf16 of device
         // weights, host RAM stays at ~2.3 GB anonymous).
         if (device_weights_) {
+        // Q/K/V FUSED — same shape of win as the gate+up fusion below, and the
+        // previous comment here ("they cannot be a single GEMM without padding
+        // buffers") was true only for a PADDED concat. With a ragged one it is
+        // exact: the three output widths are just stacked, [q_out | kv_out |
+        // kv_out], and the kernel is a plain row-major [sum_out, H] GEMM. No
+        // padding, no slicing, no extra kernel.
+        //
+        // This is the lever the repo's own measurement pointed at: "the cost is
+        // not the transfer lock, it is one clFinish per projection (7 x 28 =
+        // 196 round-trips per token)" (29e784c). Fusing QKV takes the layer
+        // from 7 round-trips to 5. The weights are concatenated ONCE, at
+        // upload, by warm_device_weights(), and cached under one tag.
+        //
+        // The fused path needs a single bias vector folded into the kernel. The
+        // three biases have different lengths, so they are concatenated the same
+        // way; when the checkpoint has none (Qwen3, Llama) we pass no bias and
+        // the three separate kernels below keep handling the all-zero case.
+        if (gpu_->has_weight(("L" + std::to_string(layer) + ".qkv_proj").c_str())) {
+            const int qkv_out = w.q_out + 2 * w.kv_out;
+            std::vector<float> qkv((size_t)seq_len * qkv_out);
+            gpu_->matmul_device(("L" + std::to_string(layer) + ".qkv_proj").c_str(),
+                                hn.data(), seq_len, qkv_out, H,
+                                (w.q_b.size() + w.k_b.size() + w.v_b.size())
+                                    ? w.qkv_b.data() : nullptr,
+                                qkv.data());
+            for (int t = 0; t < seq_len; ++t) {
+                const float* row = qkv.data() + (size_t)t * qkv_out;
+                std::memcpy(q.data() + (size_t)t * w.q_out, row,
+                            (size_t)w.q_out * sizeof(float));
+                std::memcpy(k.data() + (size_t)t * w.kv_out, row + w.q_out,
+                            (size_t)w.kv_out * sizeof(float));
+                std::memcpy(v.data() + (size_t)t * w.kv_out, row + w.q_out + w.kv_out,
+                            (size_t)w.kv_out * sizeof(float));
+            }
+        } else {
             gpu_->matmul_device(("L" + std::to_string(layer) + ".q_proj").c_str(),
                                 hn.data(), seq_len, w.q_out, H,
                                 w.q_b.empty() ? nullptr : w.q_b.data(), q.data());
@@ -478,6 +709,7 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
             gpu_->matmul_device(("L" + std::to_string(layer) + ".v_proj").c_str(),
                                 hn.data(), seq_len, w.kv_out, H,
                                 w.v_b.empty() ? nullptr : w.v_b.data(), v.data());
+        }
         } else {
         gpu_->matmul(hn.data(), seq_len, w.q_w.data(), w.q_out, H,
                      w.q_b.empty() ? nullptr : w.q_b.data(), q.data(),
@@ -558,13 +790,13 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
         }
     }
 
-    {
+    { ScopedTimer _t(g_phase, g_phase.rope, g_phase.on && seq_len == 1);
         const int half = hd / 2;
         std::vector<float> cosT((size_t)seq_len * half), sinT((size_t)seq_len * half);
         for (int t = 0; t < seq_len; ++t) {
             const int abs_pos = cache_pos + t;
             for (int j = 0; j < half; ++j) {
-                const float inv = std::pow(cfg_.rope_theta, -2.0f * j / (float)hd);
+                const float inv = RoPEInvFreq(j);
                 const float ang = (float)abs_pos * inv;
                 cosT[(size_t)t * half + j] = std::cos(ang);
                 sinT[(size_t)t * half + j] = std::sin(ang);
@@ -609,7 +841,63 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     // Paridade verificada nos buffers reais: 1,9e-06 contra a referência em
     // numpy, e o estado escondido das camadas 0..2 difere em menos de 6e-06
     // entre os dois caminhos.
-    if (gpu_ != nullptr && gpu_->has_attention()) {
+    { ScopedTimer _t(g_phase, g_phase.attn, g_phase.on && seq_len == 1);
+    const bool attn_gpu = gpu_ != nullptr && gpu_->has_attention();
+    // The resident path is preferred whenever the buffers exist: it ships only
+    // the new rows instead of the whole cache. Both paths produce the same
+    // numbers (parity verified against transformers), so this is a pure
+    // bandwidth decision.
+    // ── KV cache residente no device: implementado, exato, e MAIS LENTO ───
+    //
+    // A hipótese era que os 48 reenvios bloqueantes do cache por token fossem o
+    // gargalo. Medido A/B no MESMO binário, ctx=512, 24 tokens por braço:
+    //
+    //   residente  192 ms/token   (157 -> 192, +22%)
+    //   reenvio    157 ms/token   (baseline)
+    //
+    // Paridade exata nos dois (cos=1.0 contra transformers, PPL 48,0367 vs
+    // 48,0341 em ambos). Ou seja: a correção está certa e não paga.
+    //
+    // A leitura que sobrou dos números: o tempo medido por chamada de atenção
+    // (10,8 ms) NÃO é transferência — é o host esperando trabalho já enfileirado
+    // dos matmuls. Por isso a soma das 24 chamadas (259 ms) excede o token
+    // inteiro (111 ms). O número sólido é o tempo de kernel, medido por evento:
+    // ~55 ms de 111 (49%) é compute de device, e o resto é host + sync.
+    //
+    // Fica opt-in (WINNEX_KV_RESIDENT=1) porque o código é correto e serve de
+    // base para a versão que reduzir o número de launches, não só os bytes.
+    static const bool kv_resident_ok = [] {
+        const char* v = std::getenv("WINNEX_KV_RESIDENT");
+        return v && std::string(v) == "1";
+    }();
+    const bool attn_res = attn_gpu && kv_resident_ok && gpu_->has_kv(layer);
+    if (g_phase.on && seq_len == 1) {
+        // Split the attention block: the KV-cache memcpy below is separate
+        // from the device call, and they were being charged together.
+        auto _a = std::chrono::steady_clock::now();
+        if (attn_res) {
+            // k_cache/v_cache hold the WHOLE cache; the device needs only the
+            // rows being appended, or position cache_pos would receive row 0.
+            // (This was the first version's bug: prefill was exact because
+            // cache_pos == 0, decode diverged silently.)
+            const size_t newrow = (size_t)cache_pos * (size_t)w.kv_out;
+            gpu_->attention_resident(layer, q.data(), k_cache.data() + newrow,
+                                     v_cache.data() + newrow,
+                                     attn_out.data(), seq_len, nh, nkv, hd, cache_pos);
+            g_phase.attn_gpu += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - _a).count();
+        } else if (attn_gpu) {
+            gpu_->attention(q.data(), k_cache.data(), v_cache.data(), attn_out.data(),
+                            seq_len, cache_pos + seq_len, nh, nkv, hd, cache_pos);
+            g_phase.attn_gpu += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - _a).count();
+        }
+    } else if (attn_res) {
+        const size_t newrow = (size_t)cache_pos * (size_t)w.kv_out;
+        gpu_->attention_resident(layer, q.data(), k_cache.data() + newrow,
+                                 v_cache.data() + newrow,
+                                 attn_out.data(), seq_len, nh, nkv, hd, cache_pos);
+    } else if (attn_gpu) {
         gpu_->attention(q.data(), k_cache.data(), v_cache.data(), attn_out.data(),
                         seq_len, cache_pos + seq_len, nh, nkv, hd, cache_pos);
     } else {
@@ -733,6 +1021,8 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     }
     }  // fim do caminho CPU de atenção
 
+    }  // ScopedTimer(attn)
+
     // 6. Output projection + residual.
     std::vector<float> proj(seq_len * H);
     if (gpu_ != nullptr) {
@@ -753,7 +1043,8 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
                          w.o_w.data(), w.q_out, H);
         }
     }
-    for (int i = 0; i < seq_len * H; ++i) h[i] += proj[i];
+    { ScopedTimer _t(g_phase, g_phase.resid, g_phase.on && seq_len == 1);
+      for (int i = 0; i < seq_len * H; ++i) h[i] += proj[i]; }
 
     // 7. Post attention norm + MLP (gate*up -> down, SiLU gating).
     std::vector<float> hn2(H * seq_len);
@@ -804,11 +1095,12 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
             dense_matmul(up.data() + (size_t)t * w.inter, xt, w.u_w.data(), H, w.inter);
         }
     }
-    for (int i = 0; i < seq_len * w.inter; ++i) {
+    { ScopedTimer _t(g_phase, g_phase.mlp_epi, g_phase.on && seq_len == 1);
+      for (int i = 0; i < seq_len * w.inter; ++i) {
         float g = gate[i];
         gate[i] = g / (1.0f + std::exp(-g));  // SiLU (CPU, elementwise)
         gate[i] *= up[i];
-    }
+      } }
     if (gpu_ != nullptr) {
         if (device_weights_)
             gpu_->matmul_device(("L" + std::to_string(layer) + ".down_proj").c_str(),
@@ -895,12 +1187,33 @@ void ForwardEngine::lm_head_logits(const float* hnorm, float* logits,
     const SafeTensor& t = lm_head_tensor();
     const int H = cfg_.hidden_size;
     const int V = (int)t.shape[0];
-    // Block size is a throughput/memory trade. 32 rows meant 4752 blocks for
-    // the 7B, each paying an OpenMP region launch and a malloc — measured, it
-    // took the CPU path from 73 s to 125 s. 512 rows is 7.3 MB, still nothing
-    // against the 2.18 GB the table would cost, and leaves the rows wide
-    // enough for the parallel-for to fill the cores.
-    const int BLOCK = 512;
+    // Block size is a throughput/memory trade, and it depends on how many
+    // positions are being projected — which is why a single constant was wrong
+    // in both directions:
+    //
+    //   n_positions == 1 (decode, the hot path): the block is walked once per
+    //   token. Too big and the table streams through the cache every token:
+    //   measured on Qwen2.5-0.5B, lm_head went from 47 ms to 160.9 ms/token
+    //   when the block was raised to ~14k rows. Small blocks win here because
+    //   the working set stays hot and the per-block OpenMP launch is amortised
+    //   over the next token's identical block.
+    //
+    //   n_positions > 1 (prefill, and the CPU quality harness): every block is
+    //   reused n_positions times, so the launch overhead dominates and big
+    //   blocks win — measured whole-table on CPU: BLOCK=512 took 7.91 s against
+    //   0.93 s at BLOCK=4096 for the same logits.
+    //
+    // So: small and cache-friendly for decode, large and launch-efficient for
+    // multi-position calls. Overridable for measurement.
+    int BLOCK;
+    if (const char* env = std::getenv("WINNEX_LMHEAD_BLOCK")) {
+        BLOCK = std::max(64, std::atoi(env));
+    } else if (n_positions <= 1) {
+        BLOCK = 512;
+    } else {
+        BLOCK = (int)std::min<size_t>(16384, std::max<size_t>(
+            2048, (48u * 1024u * 1024u) / ((size_t)H * sizeof(float))));
+    }
     for (int v0 = 0; v0 < V; v0 += BLOCK) {
         const int n = std::min(BLOCK, V - v0);
         std::vector<float> block = st_->read_rows(t, v0, n);   // no second copy
@@ -916,6 +1229,22 @@ void ForwardEngine::lm_head_logits(const float* hnorm, float* logits,
     }
 }
 
+// ── Device timing (forwarded to the OpenCL backend) ────────────────────────
+void ForwardEngine::profiling_enable(bool on) { if (gpu_) gpu_->profiling_enable(on); }
+double ForwardEngine::profiling_kernel_ms() const {
+    return gpu_ ? gpu_->profiling_kernel_ms() : 0.0; }
+double ForwardEngine::profiling_wall_ms() const {
+    return gpu_ ? gpu_->profiling_wall_ms() : 0.0; }
+double ForwardEngine::profiling_attn_ms() const {
+    return gpu_ ? gpu_->profiling_attn_ms() : 0.0; }
+int ForwardEngine::profiling_attn_calls() const {
+    return gpu_ ? gpu_->profiling_attn_calls() : 0; }
+int ForwardEngine::profiling_kernels() const {
+    return gpu_ ? gpu_->profiling_kernels() : 0; }
+std::vector<std::pair<std::string, std::pair<int, double>>>
+ForwardEngine::profiling_by_tag() const {
+    return gpu_ ? gpu_->profiling_by_tag() : decltype(gpu_->profiling_by_tag())(); }
+
 ForwardEngine::~ForwardEngine() {
     delete gpu_;      // releases the OpenCL context, program and kernel
     gpu_ = nullptr;
@@ -925,6 +1254,40 @@ ForwardEngine::~ForwardEngine() {
 // Enables OpenCL for the four attention projections of every layer. Throws
 // when the device cannot be brought up — there is no CPU fallback, by design
 // (see the header comment in forward_gpu.cpp).
+// ── CPU residency: decided once, at construction ───────────────────────────
+//
+// Holding every layer resident is what makes the CPU path usable. Without it,
+// run_layer() calls load_layer() per layer, which re-reads the checkpoint (7
+// matrices per layer) — per layer, per token. The cost is not marginal:
+// measured 0.27 tok/s on the 0.5B, 1,250x slower than the GPU path.
+//
+// This lived inside enable_gpu() until 0.1.35, behind `if (gpu_ == nullptr)`.
+// The condition was correct; the placement was not. A caller that never calls
+// enable_gpu() — the whole point of the CPU path — never reached it.
+//
+// Fails soft: if the bytes do not fit the budget, leave resident_ empty and
+// report "stream". Streaming is slower but correct, and the caller can see it
+// in weight_mode().
+void ForwardEngine::decide_cpu_residency() {
+    const double bytes_resident = estimate_resident_bytes();
+    const double budget = available_ram_bytes() * 0.60;
+    if (bytes_resident > budget || cfg_.num_hidden_layers <= 0) {
+        resident_.clear();
+        layers_resident_ = false;
+        weight_mode_ = "stream";
+        return;
+    }
+    if (!layers_resident_) {
+        resident_.resize((size_t)cfg_.num_hidden_layers);
+        for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
+            resident_[(size_t)l] = std::make_unique<LayerWeights>();
+            load_layer(l, *resident_[(size_t)l]);
+        }
+        layers_resident_ = true;
+    }
+    weight_mode_ = "resident";
+}
+
 void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
     if (gpu_ != nullptr) return;
     gpu_ = new ForwardGpu(opencl_lib);
@@ -971,25 +1334,11 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
     const double ram_avail = available_ram_bytes();
     const double budget = ram_avail * 0.60;
 
-    // RESIDENT SÓ SEM GPU: com GPU os pesos vão para o device e o cache é
-    // indexado por nome, então endereço estável não serve para nada. Medido no
-    // Qwen3-4B: este bloco alocava 13,5 GB de heap anônimo que o warmup
-    // tornava inútil em seguida (14,15 GB -> 0,30 GB ao pulá-lo).
-    if (gpu_ == nullptr && bytes_resident <= budget) {
-        if (!layers_resident_) {
-            resident_.resize((size_t)cfg_.num_hidden_layers);
-            for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
-                resident_[(size_t)l] = std::make_unique<LayerWeights>();
-                load_layer(l, *resident_[(size_t)l]);
-            }
-            layers_resident_ = true;
-        }
-        weight_mode_ = "resident";
-    } else if (gpu_ == nullptr) {
-        // Streaming: run_layer falls through to w_scratch (one layer at a time)
-        // because resident_ stays empty.
-        weight_mode_ = "stream";
-    }
+    // Residency was decided at construction (decide_cpu_residency). If the GPU
+    // is up, the weights go to the device instead and resident_ is not used;
+    // if it is not up, residency is already in place. Nothing to decide here.
+    (void)bytes_resident;
+    (void)budget;
     // Warm the device copy once. Done here rather than lazily inside the first
     // forward so the upload cost does not land inside a timed region, and so a
     // device that cannot hold the weights fails at enable_gpu() rather than
@@ -1099,9 +1448,67 @@ bool ForwardEngine::warm_device_weights() {
                          (T + tag).c_str());
             std::vector<float>().swap(Wt);      // release before the next one
         };
-        push("q_proj",    L + "self_attn.q_proj", w.q_out, H, w.q_b);
-        push("k_proj",    L + "self_attn.k_proj", w.kv_out, H, w.k_b);
-        push("v_proj",    L + "self_attn.v_proj", w.kv_out, H, w.v_b);
+        // Q/K/V FUSED into one [q_out + 2·kv_out, H] buffer, under one tag.
+        //
+        // run_layer() asks for "qkv_proj" and gets all three from a single
+        // kernel: A crosses the bus once and, more importantly, the layer pays
+        // ONE round-trip instead of three. That is the number the repo already
+        // measured as the cost ("7 x 28 = 196 round-trips per token", 29e784c),
+        // and the fusion is exact — the output widths are stacked, not padded,
+        // so the kernel is a plain row-major GEMM with out_dim = q_out+2·kv_out.
+        //
+        // The individual tags are still pushed when the fused upload is not
+        // possible, so a checkpoint whose biases do not line up degrades to the
+        // three-kernel path instead of failing.
+        {
+            std::vector<float> qw = st_->to_float(st_->get(L + "self_attn.q_proj.weight"));
+            std::vector<float> kw = st_->to_float(st_->get(L + "self_attn.k_proj.weight"));
+            std::vector<float> vw = st_->to_float(st_->get(L + "self_attn.v_proj.weight"));
+            const bool sizes_ok = (int)qw.size() == w.q_out * H &&
+                                  (int)kw.size() == w.kv_out * H &&
+                                  (int)vw.size() == w.kv_out * H;
+            if (sizes_ok) {
+                std::vector<float> qkv;
+                qkv.reserve(qw.size() + kw.size() + vw.size());
+                qkv.insert(qkv.end(), qw.begin(), qw.end());
+                qkv.insert(qkv.end(), kw.begin(), kw.end());
+                qkv.insert(qkv.end(), vw.begin(), vw.end());
+                // Bias: concatenated in the same order, or none at all. The
+                // kernel takes a single [out_dim] vector, so a partial set of
+                // biases cannot be represented — fall back when that happens.
+                std::vector<float> bcat;
+                const bool all_b = w.q_b.size() == (size_t)w.q_out &&
+                                   w.k_b.size() == (size_t)w.kv_out &&
+                                   w.v_b.size() == (size_t)w.kv_out;
+                const bool none_b = w.q_b.empty() && w.k_b.empty() && w.v_b.empty();
+                const bool bias_ok = all_b || none_b;
+                if (bias_ok) {
+                    if (all_b) {
+                        bcat.reserve(w.q_out + 2 * w.kv_out);
+                        bcat.insert(bcat.end(), w.q_b.begin(), w.q_b.end());
+                        bcat.insert(bcat.end(), w.k_b.begin(), w.k_b.end());
+                        bcat.insert(bcat.end(), w.v_b.begin(), w.v_b.end());
+                    }
+                    out.assign((size_t)(w.q_out + 2 * w.kv_out), 0.0f);
+                    gpu_->matmul(dummy.data(), 1, qkv.data(), w.q_out + 2 * w.kv_out, H,
+                                 all_b ? bcat.data() : nullptr, out.data(),
+                                 (T + "qkv_proj").c_str());
+                }
+                if (!bias_ok) {
+                    push("q_proj", L + "self_attn.q_proj", w.q_out, H, w.q_b);
+                    push("k_proj", L + "self_attn.k_proj", w.kv_out, H, w.k_b);
+                    push("v_proj", L + "self_attn.v_proj", w.kv_out, H, w.v_b);
+                }
+                std::vector<float>().swap(qkv);
+            } else {
+                push("q_proj", L + "self_attn.q_proj", w.q_out, H, w.q_b);
+                push("k_proj", L + "self_attn.k_proj", w.kv_out, H, w.k_b);
+                push("v_proj", L + "self_attn.v_proj", w.kv_out, H, w.v_b);
+            }
+            std::vector<float>().swap(qw);
+            std::vector<float>().swap(kw);
+            std::vector<float>().swap(vw);
+        }
         push("o_proj",    L + "self_attn.o_proj", H, w.q_out, {});
 
         // GATE + UP FUSED into one [2·inter, H] buffer.
@@ -1274,6 +1681,22 @@ std::vector<float> ForwardEngine::prefill(const std::vector<int>& ids) {
     k_caches_.assign(cfg_.num_hidden_layers, std::vector<float>((size_t)n * kv_out));
     v_caches_.assign(cfg_.num_hidden_layers, std::vector<float>((size_t)n * kv_out));
 
+    // Reserve the device-side KV cache for this sequence length. Sizing it here
+    // (rather than lazily inside the first attention) keeps the allocation out
+    // of any timed decode region and makes an out-of-memory failure happen at
+    // prefill, where the caller can still react.
+    //
+    // Reserve with headroom: a caller that prefills n tokens and then decodes
+    // m more would otherwise need a reallocation mid-generation. The margin is
+    // capped by max_position_embeddings so a 32k context does not reserve 64k.
+    if (gpu_ != nullptr) {
+        const int max_pos = cfg_.max_position_embeddings > 0
+                            ? cfg_.max_position_embeddings : n;
+        const int want = std::min(max_pos, n + std::max(256, n / 2));
+        gpu_->prepare_kv(want, cfg_.num_key_value_heads, cfg_.head_dim,
+                         cfg_.num_hidden_layers);
+    }
+
     std::vector<float> h = embed_ids(ids);
     for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
         run_layer(layer, h, n, k_caches_[layer], v_caches_[layer], 0);
@@ -1284,7 +1707,9 @@ std::vector<float> ForwardEngine::prefill(const std::vector<int>& ids) {
     rms_norm(hnorm.data(), h.data() + (size_t)(n - 1) * H, final_norm_.data(),
              1, H, cfg_.rms_norm_eps);
     std::vector<float> logits(cfg_.vocab_size);
-    lm_head_logits(hnorm.data(), logits.data(), 1, H);
+    { ScopedTimer _t(g_phase, g_phase.lmh, g_phase.on);
+      lm_head_logits(hnorm.data(), logits.data(), 1, H); }
+    ++g_phase.n;
     return logits;
 }
 

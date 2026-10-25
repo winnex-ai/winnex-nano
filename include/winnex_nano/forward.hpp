@@ -72,6 +72,31 @@ struct ModelConfig {
     // history the model was trained to ignore.
     bool has_sliding_window = false;  // sliding_window present in config
     int sliding_window = 0;           // its value; inert when >= max_position
+
+    // ── rope_scaling ──────────────────────────────────────────────────────
+    // AUSENTE ATÉ AQUI, E ISSO ERA UM DEFEITO SILENCIOSO. O motor lia só
+    // `rope_theta` e ignorava `rope_scaling`. Para Qwen2.5 (sem scaling) isso
+    // não custa nada. Para Llama-3.2 — que declara
+    //
+    //   "rope_scaling": {"rope_type":"llama3","factor":32.0,
+    //                    "low_freq_factor":1.0,"high_freq_factor":4.0,
+    //                    "original_max_position_embeddings":8192}
+    //
+    // — as invariantes de frequência BAIXA (wavelen > 8192, 15 das 32
+    // dimensões) são divididas por 32, e as de frequência alta ficam intactas.
+    // Ignorar o scaling fazia o motor rodar um modelo DIFERENTE, com erro de
+    // fase que cresce com a posição: 0,13 rad em pos=128, 1,0 rad em 1024,
+    // 8,1 rad em 8192. Medido contra o transformers no Llama-3.2-1B: cos dos
+    // logits cai para 0,9979 em 1024 tokens, contra 0,99985 no Qwen sem scaling.
+    //
+    // rope_type vazio = sem scaling (o caso Qwen). Um rope_type PRESENTE e não
+    // suportado é recusado em load_config, pelo mesmo contrato do gate de
+    // arquitetura: recusar em vez de rodar errado.
+    std::string rope_type;                 // "" | "llama3"
+    float rope_factor = 1.0f;
+    float rope_low_freq_factor = 1.0f;
+    float rope_high_freq_factor = 4.0f;
+    int rope_original_max_pos = 0;         // 0 -> usa max_position_embeddings
 };
 
 // Loads a ModelConfig from a config.json (minimal parser).
@@ -224,6 +249,21 @@ private:
     std::vector<float> embed_tokens_;
     int embed_tokens_shape_h_ = 0;
 
+    // Invariante de frequência de RoPE para a dimensão par `j` (j em [0, hd/2)).
+    //
+    // Sem scaling: theta^(-2j/hd), a fórmula clássica.
+    //
+    // Com rope_type == "llama3": a mesma base, depois
+    //   - wavelen > original_max/low_freq  -> divide por `factor`
+    //   - wavelen < original_max/high_freq -> fica
+    //   - entre os dois                    -> interpolação suave
+    // Verificado contra `m.model.rotary_emb.inv_freq` do transformers no
+    // Llama-3.2-1B: erro relativo máximo 2,1e-7 em todas as 32 dimensões.
+    //
+    // Fica como membro (e não como lambda no laço) porque o laço chama isto
+    // seq_len·hd/2 vezes e o valor depende só de j — sem estado por posição.
+    float RoPEInvFreq(int j) const;
+
     // One row of lm_head (the tied embedding). Returns H floats. Uses the
     // offset table and converts only the requested row, so decoding a token
     // touches 14 KB instead of 2.18 GB.
@@ -255,6 +295,18 @@ private:
     bool device_weights_ = false;
     std::string gpu_refusal_;
 
+public:
+    // Device-side timing, forwarded to the OpenCL backend. No-ops on the CPU
+    // path, where there are no kernels to time.
+    void profiling_enable(bool on);
+    double profiling_kernel_ms() const;
+    double profiling_wall_ms() const;
+    double profiling_attn_ms() const;
+    int profiling_attn_calls() const;
+    int profiling_kernels() const;
+    std::vector<std::pair<std::string, std::pair<int, double>>> profiling_by_tag() const;
+private:
+
     void load_layer(int layer, LayerWeights& w);
 
     // Device-resident mode: every projection is uploaded once and the host
@@ -262,6 +314,21 @@ private:
     // norms and biases (a few MB) per layer instead of the 14 GB of matrices.
     bool warm_device_weights();
     void load_layer_shallow(int layer, LayerWeights& w);
+
+    // Decides — once, at construction — whether the CPU path holds every layer
+    // resident. Called from the constructor; enable_gpu() re-runs it only to
+    // report, never to decide.
+    //
+    // This used to live inside enable_gpu(), which meant a caller that never
+    // enabled a GPU never evaluated it: resident_ stayed empty and run_layer()
+    // reloaded all seven matrices of every layer from the safetensors on every
+    // layer of every token. Measured on the published 0.1.34 wheel, CPU only,
+    // Qwen2.5-0.5B: 118.9 s for a 32-token prefill (0.27 tok/s), against
+    // 339 tok/s of prefill with the GPU. The residency condition itself was
+    // TRUE (1.43 GB estimated against a 16.8 GB budget) — it was simply never
+    // reached, because it sat behind `if (gpu_ == nullptr)` inside a function
+    // the CPU-only caller has no reason to call.
+    void decide_cpu_residency();
 
     // Core ops.
     void run_layer(int layer, std::vector<float>& h, int seq_len,

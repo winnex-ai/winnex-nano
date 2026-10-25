@@ -25,3 +25,44 @@ __pycache__/
 credentials.json
 secrets.json
 .winnex_nano_deposit_id
+
+# ── Scripts de análise e diagnóstico local ───────────────────────────────────
+# Ficam no repositório de trabalho, não no pacote. Os que documentam uma
+# medição citada em documento público sobem explicitamente com `git add -f`
+# (bench_local.py, parity_gate.py), porque um número publicado precisa do
+# script que o produziu.
+ab_finish.txt
+ab_finish2.sh
+ab_test.sh
+cpu_vs_resident.py
+fastweights.py
+final_budget.py
+firstcall.py
+kv_dbg.py
+nano_kprofile.py
+nano_parity*.json
+nano_parity.py
+one.py
+prod_audit.py
+prod_readiness.py
+psicws_check.py
+psiqrh_check.py
+psiqrh_roundtrip.py
+rankcheck.py
+verify7b.json
+verify7b.log
+verify_7b.py
+virtual_sink.json
+virtual_sink_test.py
+xfactor_check.json
+xfactor_check.py
+sink_geometry.json
+sink_geometry.py
+sink_audit.py
+sink_heads_skip.py
+xfactor_is_projector.py
+kernel_variants.py
+attn_kernel_bench.py
+attn_split_ab.py
+attn_split_ppl.py
+run_bench_winnex.sh

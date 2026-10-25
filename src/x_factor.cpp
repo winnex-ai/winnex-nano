@@ -145,7 +145,52 @@ XFactor::XFactor(const float* embed_tokens, int vocab, int dim, double variance_
         }
     }
 
-    // 6. P = X·Xᵀ (D×D).
+    // 5b. ORTONORMALIZAÇÃO DE X — sem ela P não é projetor.
+    //
+    // A iteração de potência com deflação devolve vetores que NÃO são
+    // mutuamente ortogonais: a deflação subtrai λ·v·vᵀ em float32, e o erro
+    // de arredondamento de cada passo fica nos vetores seguintes. Medido no
+    // Qwen2.5-0.5B (D=896, r=791):
+    //
+    //   max|XᵀX − I| = 2,5e-2      (deveria ser 0)
+    //   ‖P‖₂         = 1,19        (deveria ser 1; >1 é impossível)
+    //   max|P² − P|  = 3,4e-2      (deveria ser 0)
+    //
+    // Ou seja: o objeto que o cabeçalho descreve como "projetor ortogonal
+    // idempotente" não era nem idempotente nem de norma 1, e `project()`
+    // aplicava uma contração que amplifica (‖P²v‖/‖Pv‖ = 1,008). O erro é
+    // pequeno o bastante para ninguém notar e grande o bastante para tornar
+    // sem sentido qualquer afirmação do tipo "P descarta 34% da norma".
+    //
+    // Gram-Schmidt modificado, em float64. Custo O(D·r²) = 5,6e8 operações
+    // para o 0.5B, feito uma vez por modelo. Medido depois: max|P²−P| =
+    // 1,7e-15, ‖P‖₂ = 1,000000. A variância capturada cai de 0,9554 (a
+    // inflada pelo erro) para 0,9520, contra 0,9503 do eigh direto.
+    {
+        std::vector<double> Q((size_t)dim * r, 0.0);
+        for (int j = 0; j < r; ++j) {
+            std::vector<double> v(dim);
+            for (int i = 0; i < dim; ++i) v[i] = X_[(size_t)i * r + j];
+            for (int p = 0; p < j; ++p) {
+                double dot = 0.0;
+                for (int i = 0; i < dim; ++i) dot += Q[(size_t)i * r + p] * v[i];
+                for (int i = 0; i < dim; ++i) v[i] -= dot * Q[(size_t)i * r + p];
+            }
+            double nrm = 0.0;
+            for (int i = 0; i < dim; ++i) nrm += v[i] * v[i];
+            nrm = std::sqrt(nrm);
+            if (!(nrm > 0.0)) {   // direção colapsou: não há para onde projetar
+                for (int i = 0; i < dim; ++i) Q[(size_t)i * r + j] = 0.0;
+                continue;
+            }
+            for (int i = 0; i < dim; ++i) Q[(size_t)i * r + j] = v[i] / nrm;
+        }
+        for (int i = 0; i < dim; ++i)
+            for (int j = 0; j < r; ++j)
+                X_[(size_t)i * r + j] = (float)Q[(size_t)i * r + j];
+    }
+
+    // 6. P = X·Xᵀ (D×D). Com X ortonormal, P é o projetor ortogonal.
     P_.assign((size_t)dim * dim, 0.0f);
     for (int a = 0; a < dim; ++a) {
         for (int b = 0; b < dim; ++b) {
