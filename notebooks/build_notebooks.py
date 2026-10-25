@@ -293,13 +293,21 @@ PAR = bench_core.task_parity(arm, prompt_ids, n_gen=50)
 print(f"50 tokens em {time.perf_counter()-t0:.1f} s ->", PAR["tokens"][:12])
 print("hash do prompt:", PAR["prompt_hash"])
 
+# O outro braco roda em container separado, entao a referencia dele so existe
+# aqui se o resultado for anexado como DATASET de entrada. Os caminhos abaixo
+# cobrem as duas formas: working (mesmo kernel) e input (dataset anexado).
 CAND = ["/kaggle/working/referencia_paridade.json", "referencia_paridade.json"]
+for _root in ("/kaggle/input",):
+    if os.path.isdir(_root):
+        for _d in sorted(os.listdir(_root)):
+            CAND.append(os.path.join(_root, _d, "referencia_paridade.json"))
 REF = None
 for c in CAND:
     if os.path.exists(c):
         d = json.load(open(c))
         if d.get("arm") != arm.name:
             REF = d
+            print("referencia do outro braco encontrada em:", c)
             break
 GATE = bench_core.compare_parity(PAR, REF)
 print("\\nGATE:", json.dumps(GATE, indent=2))
