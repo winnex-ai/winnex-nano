@@ -212,6 +212,20 @@ if(WINNEX_NANO_BUILD_TESTS)
             # rc=3 = referencia ausente. Falha, nao passa: um gate que nao
             # pode verificar tem que ser visivel.
             FAIL_REGULAR_EXPRESSION "FALHOU|SEM REFERENCIA|ERROR")
+
+        # Regressao do crescimento da reserva de KV: prefill curto -> prefill
+        # longo -> decode longo. Foi este o cenario que derrubou o kernel do
+        # Kaggle na 0.1.38 e que nenhum teste cobria.
+        #
+        # O teste devolve rc=3 quando nao ha device, porque o defeito vive no
+        # caminho residente da GPU: na CPU ele passaria com o bug presente.
+        # Verificado removendo a correcao — na CPU ficava verde, com device
+        # falhava em "context 769 exceeds reserved 768".
+        add_test(NAME forward_kv_growth
+                 COMMAND test_forward "${WINNEX_TEST_MODEL_DIR}" --growth)
+        set_tests_properties(forward_kv_growth PROPERTIES
+            FAIL_REGULAR_EXPRESSION "FALHOU"
+            SKIP_RETURN_CODE 3)
     else()
         message(STATUS "winnex-nano: test_forward nao registrado "
                        "(defina WINNEX_TEST_MODEL_DIR para ativar)")

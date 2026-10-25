@@ -90,13 +90,93 @@ void write_ref(const std::string& path, const Ref& r) {
 
 } // namespace
 
+// ── Regressão: prefill curto → prefill longo → decode longo ───────────────
+//
+// Este cenário não existia em nenhum teste, e é exatamente o que o benchmark do
+// Kaggle faz. O KV residente no device é dimensionado no prefill como
+// `prompt + max(256, prompt/2)`; um prefill de 50 tokens reserva 306 posições.
+// Um prefill seguinte de 512 estourava a reserva:
+//
+//   ForwardGpu::attention_resident: context 512 exceeds reserved 306
+//
+// e, ao ligar o caminho residente por padrão, derrubou o kernel inteiro.
+// Nenhum teste pegava, porque todos usavam um único prefill do mesmo tamanho.
+//
+// Não compara contra referência: verifica que o motor sobrevive a sequências de
+// tamanhos crescentes e que os logits são finitos. Um crash aqui é falha.
+static int run_growth_check(const std::string& dir) {
+    try {
+        ModelConfig cfg = load_config(dir + "/config.json");
+        Safetensors st(dir + "/model.safetensors");
+        ForwardEngine fe(cfg, st);
+        // O bug vive no caminho RESIDENTE DO DEVICE. Sem habilitar a GPU este
+        // teste passa mesmo com o defeito presente — verificado removendo a
+        // correção: continuava verde. Habilitar aqui é o que dá sentido ao
+        // teste; quando não há device, ele reporta que não verificou em vez de
+        // fingir que passou.
+        bool gpu = false;
+        try { fe.enable_gpu(); gpu = true; }
+        catch (const std::exception& e) {
+            printf("NAO VERIFICADO: sem device (%s).\n", e.what());
+            printf("Este teste existe para o caminho residente da GPU; na CPU ele\n"
+                   "nao exercita a reserva de KV e passaria com o bug presente.\n");
+            return 3;
+        }
+        printf("device: %s | modo de pesos: %s\n", fe.gpu_device().c_str(),
+               fe.weight_mode().c_str());
+        (void)gpu;
+        const int V = cfg.vocab_size;
+
+        struct Case { const char* what; int len; int steps; };
+        const Case cases[] = {
+            {"prefill curto (50)",              50,   0},
+            {"prefill longo (512) apos curto",  512,  0},
+            {"decode 300 passos apos 512",      512, 300},
+        };
+        for (const Case& c : cases) {
+            auto ids = test_ids(V, c.len);
+            std::vector<float> lg = fe.prefill(ids);
+            if ((int)lg.size() != V) {
+                printf("FALHOU (%s): prefill devolveu %zu logits, esperado %d\n",
+                       c.what, lg.size(), V);
+                return 1;
+            }
+            int next = 0;
+            for (int i = 0; i < c.steps; ++i) {
+                lg = fe.step(next);
+                if ((int)lg.size() != V) {
+                    printf("FALHOU (%s): step %d devolveu %zu logits\n",
+                           c.what, i, lg.size());
+                    return 1;
+                }
+                float best = lg[0];
+                next = 0;
+                for (int j = 1; j < V; ++j) if (lg[j] > best) { best = lg[j]; next = j; }
+                if (!std::isfinite(best)) {
+                    printf("FALHOU (%s): step %d produziu logit nao-finito\n", c.what, i);
+                    return 1;
+                }
+            }
+            printf("OK (%s): %d posicoes, %d passos de decode\n",
+                   c.what, c.len, c.steps);
+        }
+        printf("CRESCIMENTO OK | nenhuma reserva de KV estourou\n");
+        return 0;
+    } catch (const std::exception& e) {
+        printf("FALHOU: %s\n", e.what());
+        return 1;
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("usage: %s <model_dir> [--record]\n", argv[0]);
+        printf("usage: %s <model_dir> [--record | --growth]\n", argv[0]);
         return 2;
     }
     const std::string dir = argv[1];
     const bool record = (argc > 2 && std::string(argv[2]) == "--record");
+    if (argc > 2 && std::string(argv[2]) == "--growth")
+        return run_growth_check(dir);
     const std::string ref_path = dir + "/forward_reference.bin";
 
     try {
