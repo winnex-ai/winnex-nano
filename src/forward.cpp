@@ -1304,13 +1304,38 @@ void ForwardEngine::lm_head_logits(const float* hnorm, float* logits,
                 gpu_->matmul_device("lm_head", hnorm, n_positions, V, H, nullptr, logits);
                 return;
             }
-            // Primeira chamada: a tabela precisa existir em host para subir.
-            // 155 ms no 0,5B (519 MB), pago uma vez.
+            // Primeira chamada: a tabela precisa existir em HOST para subir ao
+            // device. 155 ms no 0,5B (519 MB), pagos uma vez.
             if (lm_head_host_.empty()) {
                 lm_head_host_ = st_->to_float(t);
             }
             gpu_->matmul(hnorm, n_positions, lm_head_host_.data(), V, H,
                          nullptr, logits, "lm_head");
+            // ── Libera a cópia de host assim que ela sobe ─────────────────
+            //
+            // O comentário anterior dizia que a tabela "continua alocada no
+            // host para que o tag permaneça válido". Isso é falso: o tag vive
+            // em `tagged`/`wcache` do ForwardGpu, indexado pelo NOME, e
+            // `weight_buffer()` casa por tag antes de qualquer fingerprint.
+            // O ponteiro de host não é lido de novo:
+            //
+            //   - se o upload deu certo, `has_weight("lm_head")` é true e a
+            //     próxima chamada pega o ramo `matmul_device`, que não olha W;
+            //   - se falhar, o `catch` abaixo marca `lm_head_on_cpu_` e o
+            //     caminho de CPU lê por blocos direto do checkpoint com
+            //     `st_->read_rows` — nunca de `lm_head_host_`.
+            //
+            // Custo medido no Qwen2.5-0.5B: 519 MB de heap anônimo retidos
+            // pelo tempo de vida do processo, para uma tabela que só é lida na
+            // primeira chamada. No 7B são 2,18 GB.
+            //
+            // Um `clear()` sozinho não basta: o vetor é grande o suficiente
+            // para vir de mmap, e devolver o mapeamento é o que o
+            // `shrink_to_fit()` faz.
+            if (gpu_->has_weight("lm_head")) {
+                lm_head_host_.clear();
+                lm_head_host_.shrink_to_fit();
+            }
             return;
         } catch (const std::exception& e) {
             // Uma falha aqui não pode derrubar o token: o caminho da CPU logo
