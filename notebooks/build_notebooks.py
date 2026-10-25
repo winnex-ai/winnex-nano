@@ -15,7 +15,7 @@ import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VERSAO = "0.1.36"
+VERSAO = "0.1.37"
 
 # Os dois braços têm que ver os MESMOS itens. O seed é fixo e a amostra é
 # canônica (ordenada por conteúdo antes de embaralhar), então o hash dos itens
