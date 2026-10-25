@@ -586,6 +586,66 @@ __kernel void attention_causal(
 }
 )";
 
+// ── GEMV para seq pequeno: o GEMM tiled desperdiça o tile inteiro no decode ──
+//
+// gemm_bias é um GEMM tiled 16x16: eixo x = linha de saída, eixo y = posição
+// da sequência. No DECODE seq é sempre 1, então 255 das 256 threads do tile
+// fazem trabalho mascarado. Pior: a linha de saída é o eixo RÁPIDO e k é o
+// eixo LENTO, então threads vizinhas leem W com passo de `in_dim * 4` bytes —
+// 28 a 152 linhas de cache por elemento útil (~3% de eficiência).
+//
+// MEDIDO nesta máquina (RTX 5060 Ti, ~448 GB/s de pico), W[151936 x 896] f32:
+//
+//   gemm_bias      7,60 ms    71,7 GB/s  (16% do pico)
+//   gemv_bias      1,28 ms   425,1 GB/s  (95% do pico)   -> 5,9x
+//
+// O prefill NÃO usa este kernel: com seq grande o tiled amortiza o
+// carregamento de W sobre 16 posições e ganha. A escolha é feita em
+// matmul_device() por `seq`, não por heurística de tamanho de tensor.
+//
+// Um work-group por linha de saída; as GEMV_WG lanes leem a linha em float4
+// (contígua) e reduzem em memória local.
+#define GEMV_WG 64
+const char* kGemvSrc = R"(
+#define GEMV_WG 64
+
+__kernel __attribute__((reqd_work_group_size(GEMV_WG, 1, 1)))
+void gemv_bias(
+    __global const float* A,      // [seq, in]  (seq == 1)
+    __global const float* W,      // [out, in]
+    __global const float* bias,   // [out] (has_bias=0 -> ignored)
+    __global float* C,            // [seq, out]
+    int in_dim, int out_dim, int has_bias)
+{
+    __local float red[GEMV_WG];
+    const int row  = (int)get_group_id(0);
+    const int lane = (int)get_local_id(0);
+
+    float acc = 0.0f;
+    if (row < out_dim) {
+        __global const float4* wr = (__global const float4*)(W + (size_t)row * in_dim);
+        __global const float4* ar = (__global const float4*)(A);
+        const int nv = in_dim >> 2;
+        for (int i = lane; i < nv; i += GEMV_WG) {
+            float4 w = wr[i];
+            float4 a = ar[i];
+            acc += w.x * a.x + w.y * a.y + w.z * a.z + w.w * a.w;
+        }
+    }
+    red[lane] = acc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = GEMV_WG / 2; s > 0; s >>= 1) {
+        if (lane < s) red[lane] += red[lane + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lane == 0 && row < out_dim) {
+        float v = red[0];
+        if (has_bias) v += bias[row];
+        C[row] = v;
+    }
+}
+)";
+
 } // namespace
 
 namespace winnex_nano {
@@ -596,6 +656,7 @@ struct ForwardGpu::Impl {
     cl_program prog = nullptr;
     cl_kernel k_gemm = nullptr;
     cl_kernel k_gemm_bf16 = nullptr;
+    cl_kernel k_gemv = nullptr;   // seq==1: 5,9x o GEMM tiled (ver kGemvSrc)
     cl_kernel k_attn = nullptr;
     cl_kernel k_attn_split = nullptr;
     cl_kernel k_attn_res = nullptr;
@@ -856,6 +917,7 @@ struct ForwardGpu::Impl {
         if (bb) g_api->clReleaseMemObject(bb);
         if (k_gemm) g_api->clReleaseKernel(k_gemm);
         if (k_gemm_bf16) g_api->clReleaseKernel(k_gemm_bf16);
+        if (k_gemv) g_api->clReleaseKernel(k_gemv);
         if (k_attn) g_api->clReleaseKernel(k_attn);
         if (k_attn_split) g_api->clReleaseKernel(k_attn_split);
         if (q_buf) g_api->clReleaseMemObject(q_buf);
@@ -940,6 +1002,11 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
                        std::to_string(dev_local / 1024) + " KB";
         }
     }
+    // O GEMV do decode vive num programa separado da fonte do GEMM porque não
+    // passa pela remoção condicional do attention_split — são arquivos .cl
+    // independentes concatenados aqui.
+    prog_src += "\n";
+    prog_src += kGemvSrc;
 
     const char* src = prog_src.c_str();
     impl_->prog = g_api->clCreateProgramWithSource(impl_->ctx, 1, &src, nullptr, &err);
@@ -1004,6 +1071,11 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
         impl_->k_gemm_bf16 = g_api->clCreateKernel(impl_->prog, "gemm_bias_bf16", &err);
     if (err != CL_SUCCESS || !impl_->k_gemm || !impl_->k_gemm_bf16)
         throw std::runtime_error("ForwardGpu: clCreateKernel failed");
+    // GEMV é opcional: se faltar, matmul_device cai no GEMM tiled. Amarrar o
+    // motor inteiro a ele transformaria uma otimização de decode numa
+    // dependência de boot.
+    impl_->k_gemv = g_api->clCreateKernel(impl_->prog, "gemv_bias", &err);
+    if (err != CL_SUCCESS) impl_->k_gemv = nullptr;
 
     g_reason = std::string("ok: ") + impl_->dev_name;
 }
@@ -1339,15 +1411,63 @@ void ForwardGpu::matmul_device(const char* tag, const float* A, int seq,
 
     cl_mem ba = impl_->ba, bb = impl_->bb, bc = impl_->bc;
     const int has_bias = bias ? 1 : 0;
-    Impl::set_args_checked(kern, ba, bw, bb, bc, seq, in_dim, out_dim, has_bias);
 
-    const size_t lws[2] = {(size_t)TSB, (size_t)TSB};
-    const size_t gsz[2] = {((size_t)out_dim + TSB - 1) / TSB * TSB,
-                           ((size_t)seq + TSB - 1) / TSB * TSB};
+    // ── escolha do kernel: GEMV quando seq é pequeno ─────────────────────
+    //
+    // O GEMM tiled lança um tile 16x16 por 16 posições de sequência. Para
+    // seq=1 isso significa 255/256 threads mascaradas e leitura de W com passo
+    // de in_dim*4 bytes (ver kGemvSrc). O GEMV lê uma linha por work-group com
+    // float4 contíguo.
+    //
+    // Condição: seq == 1, EXATAMENTE. O kernel lê só a linha 0 de A e escreve
+    // C[row] — ele não tem laço sobre posições. Usá-lo com seq > 1 produzia
+    // lixo nas posições 1..seq-1, e não as deixava nem zeradas: em 2 <= seq <=
+    // 16 o buffer C conservava o conteúdo da chamada anterior.
+    //
+    // Isso foi medido antes de publicar (paridade CPU vs GPU em
+    // Qwen2.5-0.5B e Llama-3.2-1B):
+    //
+    //   n=1   max|d| = 2,4e-04   argmax igual
+    //   n=5   max|d| = 1,7e+01   argmax DIFERENTE   <- bug
+    //   n=16  max|d| = 1,0e+02   argmax DIFERENTE   <- bug
+    //   n=20  max|d| = 5,3e-05   argmax igual        (caminho tiled)
+    //
+    // A faixa "seq <= 16" que eu havia escrito generalizava indevidamente a
+    // medição de reqd_work_group_size. O decode é seq==1 e isso é tudo o que
+    // este kernel precisa cobrir.
+    const bool use_gemv = impl_->k_gemv && !is_bf16 && seq == 1 &&
+                          (in_dim % 4) == 0;
     cl_event ev_k = nullptr;
     const bool prof = g_api->clGetEventProfilingInfo && g_prof.on;
-    err = g_api->clEnqueueNDRangeKernel(impl_->q, kern, 2, nullptr, gsz, lws,
-                                        0, nullptr, prof ? &ev_k : nullptr);
+
+    if (use_gemv) {
+        // O GEMV não tem o argumento `seq`: ele só existe para seq==1 e não há
+        // posição a indexar. Args: (A, W, bias, C, in_dim, out_dim, has_bias).
+        struct { cl_uint i; size_t sz; const void* p; } ga[7] = {
+            {0, sizeof(cl_mem), &ba}, {1, sizeof(cl_mem), &bw},
+            {2, sizeof(cl_mem), &bb}, {3, sizeof(cl_mem), &bc},
+            {4, sizeof(int), &in_dim}, {5, sizeof(int), &out_dim},
+            {6, sizeof(int), &has_bias},
+        };
+        for (auto& e : ga) {
+            const cl_int e2 = g_api->clSetKernelArg(impl_->k_gemv, e.i, e.sz, e.p);
+            if (e2 != CL_SUCCESS)
+                throw std::runtime_error("ForwardGpu: clSetKernelArg gemv(" +
+                                         std::to_string(e.i) + ") failed (" +
+                                         std::to_string(e2) + ")");
+        }
+        const size_t gsz1[1] = {(size_t)out_dim * GEMV_WG};
+        const size_t lws1[1] = {(size_t)GEMV_WG};
+        err = g_api->clEnqueueNDRangeKernel(impl_->q, impl_->k_gemv, 1, nullptr,
+                                            gsz1, lws1, 0, nullptr, prof ? &ev_k : nullptr);
+    } else {
+        Impl::set_args_checked(kern, ba, bw, bb, bc, seq, in_dim, out_dim, has_bias);
+        const size_t lws[2] = {(size_t)TSB, (size_t)TSB};
+        const size_t gsz[2] = {((size_t)out_dim + TSB - 1) / TSB * TSB,
+                               ((size_t)seq + TSB - 1) / TSB * TSB};
+        err = g_api->clEnqueueNDRangeKernel(impl_->q, kern, 2, nullptr, gsz, lws,
+                                            0, nullptr, prof ? &ev_k : nullptr);
+    }
     if (err != CL_SUCCESS)
         throw std::runtime_error("ForwardGpu: enqueue failed (" + std::to_string(err) +
             ") tag=" + (tag ? tag : "?") + " seq=" + std::to_string(seq) +
