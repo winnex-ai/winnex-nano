@@ -274,6 +274,16 @@ private:
     // table is never resident. `hnorm` is H floats.
     void lm_head_logits(const float* hnorm, float* logits, int n_positions, int stride) const;
     bool has_separate_lm_head_ = false;  // true when lm_head.weight exists
+    // Vira true quando o upload da tabela do lm_head para o device falha.
+    // `mutable` porque lm_head_logits() é const e o caminho GPU é um cache:
+    // a primeira falha move o motor para a CPU de forma permanente, em vez de
+    // tentar de novo a cada token (o upload que falhou custa mais que a CPU).
+    mutable bool lm_head_on_cpu_ = false;
+    // Tabela do lm_head em host, carregada uma vez quando o device a recebe.
+    // Fica vazia quando o motor fica na CPU (o caminho por blocos le do mmap
+    // e nunca materializa a tabela inteira). mutable: preenchida no primeiro
+    // lm_head_logits() const.
+    mutable std::vector<float> lm_head_host_;
 
     // Persistent KV cache: per-layer [ctx_len, kv_out].
     std::vector<std::vector<float>> k_caches_, v_caches_;

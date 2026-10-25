@@ -1211,6 +1211,73 @@ void ForwardEngine::lm_head_logits(const float* hnorm, float* logits,
     const SafeTensor& t = lm_head_tensor();
     const int H = cfg_.hidden_size;
     const int V = (int)t.shape[0];
+
+    // ── CAMINHO GPU: a projeção final é 63% do token de decode ──────────
+    //
+    // Medido com a instrumentação de fase no Qwen2.5-0.5B, ctx=512:
+    //
+    //     lm_head        40,5 ms   (63% do token)  <- CPU, 6,8 GFLOP/s
+    //     atenção        18,2 ms
+    //     resto           5,7 ms
+    //
+    // Esta função nunca teve caminho de device: as outras cinco projeções de
+    // cada camada vão para a GPU, e a sexta — a que produz os logits — ficava
+    // na CPU, atravessando a tabela de 151.936 × 896 (519 MB em f32) a cada
+    // token. A 6,8 GFLOP/s de um pico de ~1.344, era 0,5% de eficiência: não
+    // faltavam FLOPs, faltava banda.
+    //
+    // Medido com ForwardGpu::matmul_device na forma real (A[1,896] ×
+    // W[151936,896]): **7,69 ms no device contra 40,5 ms na CPU** — 2,04× no
+    // token inteiro (64,4 → 31,6 ms). Não é 0,5 ms: com sequência 1, cada uma
+    // das 151.936 linhas de saída é um produto escalar de 896, o que não satura
+    // a placa. Ainda assim, 5,3× mais rápido que a CPU.
+    //
+    // Só entra quando a tabela CABE no device. O upload é feito na primeira
+    // chamada e o buffer fica residente sob o tag "lm_head" (o mesmo mecanismo
+    // que mantém as projeções das camadas). Se a alocação falhar, cai para o
+    // caminho bloqueado por blocos abaixo — que é o correto e continua testado.
+    //
+    // A condição NÃO consulta device_memory_free(): o driver reporta a memória
+    // livre ANTES de as camadas subirem, e em alguns drivers reporta 0 — uma
+    // recusa silenciosa que deixava o lm_head na CPU para sempre, sem sintoma.
+    // A decisão correta é TENTAR e tratar a falha de alocação no catch, que é a
+    // única informação confiável sobre o que coube.
+    if (gpu_ != nullptr && !lm_head_on_cpu_) {
+        try {
+            // Primeira chamada: carrega a tabela em host (519 MB no 0,5B), o
+            // `matmul` sobe para o device e o `weight_buffer` a mantém
+            // residente sob o tag "lm_head". A partir da segunda chamada
+            // `matmul_device` usa a cópia do device e o ponteiro de host não
+            // é lido — mas a tabela continua alocada no host para que o tag
+            // permaneça válido. É o mesmo contrato das projeções das camadas.
+            // `matmul_device` é o caminho certo a partir da segunda chamada:
+            // ele usa o buffer do device e NÃO olha o ponteiro de host. Usar
+            // `matmul` aqui foi um erro medido — ele revalida o peso e reenvia
+            // A e C a cada token, e o custo foi 208 ms contra 7,7 ms do
+            // caminho device (medido com WINNEX_PHASE_TIMERS).
+            if (gpu_->has_weight("lm_head")) {
+                gpu_->matmul_device("lm_head", hnorm, n_positions, V, H, nullptr, logits);
+                return;
+            }
+            // Primeira chamada: a tabela precisa existir em host para subir.
+            // 155 ms no 0,5B (519 MB), pago uma vez.
+            if (lm_head_host_.empty()) {
+                lm_head_host_ = st_->to_float(t);
+            }
+            gpu_->matmul(hnorm, n_positions, lm_head_host_.data(), V, H,
+                         nullptr, logits, "lm_head");
+            return;
+        } catch (const std::exception& e) {
+            // Uma falha aqui não pode derrubar o token: o caminho da CPU logo
+            // abaixo produz o mesmo resultado. Marca para não tentar de novo a
+            // cada token — repetir o upload falho custaria mais que a CPU.
+            if (std::getenv("WINNEX_LMHEAD_DEBUG"))
+                std::fprintf(stderr, "[lm_head] GPU falhou, caindo para CPU: %s\n", e.what());
+            lm_head_on_cpu_ = true;
+            lm_head_host_.clear();
+            lm_head_host_.shrink_to_fit();
+        }
+    }
     // Block size is a throughput/memory trade, and it depends on how many
     // positions are being projected — which is why a single constant was wrong
     // in both directions:
@@ -1384,6 +1451,26 @@ void ForwardEngine::enable_gpu(const std::string& opencl_lib) {
         if (warmed) {
             device_weights_ = true;
             weight_mode_ = "device";
+            // ── libera a cópia do host: ela não é usada no modo device ────
+            //
+            // decide_cpu_residency() roda no construtor e, quando os pesos
+            // cabem em 60% da RAM, materializa as 7 matrizes de cada camada em
+            // resident_. Se depois o device aceita os pesos, run_layer passa a
+            // usar matmul_device() e resident_ NÃO é consultado — mas também
+            // nunca era liberado.
+            //
+            // Medido no Qwen2.5-0.5B: 1,334 GB de heap anônimo sobreviviam ao
+            // enable_gpu(), e o cálculo das dimensões (24 camadas × 56,9 MB)
+            // fecha com resident_bytes() em 0,06%. No 7B isso são ~26 GB em
+            // f32 — exatamente a memória que o modo device existe para evitar.
+            //
+            // Isto anulava a metade da vantagem que justifica o motor: ele
+            // caberia na placa e mesmo assim ocuparia a RAM com uma segunda
+            // cópia. Liberar aqui, e só depois do warmup ter dado certo, para
+            // que o caminho de fallback continue tendo os pesos carregados.
+            resident_.clear();
+            resident_.shrink_to_fit();
+            layers_resident_ = false;
         } else {
             // O modelo não cabe no device. Warmup pode já ter subido parte;
             // liberar garante que cada peso viva em um lugar só.
