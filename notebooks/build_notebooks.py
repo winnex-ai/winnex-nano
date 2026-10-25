@@ -271,10 +271,22 @@ Para cruzar: rode o outro notebook e adicione o `referencia_paridade.json` dele
 como *Add Data → Your Work → Output*, ou copie o arquivo para
 `/kaggle/working/`.
 """), code("""import time, json, os, bench_core
-PROMPT = ("The history of the Roman Empire is a long and complicated story "
-          "that begins with the founding of the city")
-prompt_ids = arm.encode(PROMPT, False)[:50]
-print("prompt:", len(prompt_ids), "tokens")
+# O prompt tem que ter EXATAMENTE 50 tokens. A versão anterior usava um texto
+# que tokenizava em 20 e aplicava `[:50]`, que nunca truncava: o gate rodou com
+# 20 tokens e o notebook imprimiu "prompt: 20 tokens" como se fosse o pedido.
+# Medido no Kaggle. Agora o texto é repetido até passar de 50 e truncado, com
+# verificação — e o mesmo texto é usado nos dois braços.
+_ALVO = 50
+_BASE = ("The history of the Roman Empire is a long and complicated story "
+         "that begins with the founding of the city and continues through "
+         "centuries of expansion, reform, division and collapse. ")
+_FILL = "In addition, the record of events across the provinces remains uneven. "
+prompt_ids = arm.encode(_BASE, False)
+while len(prompt_ids) < _ALVO:
+    prompt_ids += arm.encode(_FILL, False)
+prompt_ids = prompt_ids[:_ALVO]
+assert len(prompt_ids) == _ALVO, f"prompt com {len(prompt_ids)} tokens, esperado {_ALVO}"
+print("prompt:", len(prompt_ids), "tokens (verificado)")
 
 t0 = time.perf_counter()
 PAR = bench_core.task_parity(arm, prompt_ids, n_gen=50)

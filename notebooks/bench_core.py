@@ -483,26 +483,73 @@ def _mcq(arm, items, name):
     ]
 
 
+def load_rows(name, split="test", **kw):
+    """Carrega um dataset tentando os identificadores VÁLIDOS antes do legado.
+
+    `load_dataset("lambada", "plain_text")` funciona no `datasets` antigo e
+    FALHA no novo, que exige `namespace/nome`: o erro foi
+
+        HfUriError: Invalid HF URI 'hf://datasets/lambada@.../...'
+        Repository id must be 'namespace/name', got 'lambada'
+
+    Isso derrubou o notebook inteiro no Kaggle — LAMBADA não é opcional, e a
+    exceção subiu até o fim da célula. Aqui a lista de candidatos é tentada em
+    ordem e, se todas falharem, a tarefa devolve `status="erro"` com a causa em
+    vez de matar o notebook: a PPL e as outras métricas continuam válidas.
+    """
+    from datasets import load_dataset
+    tentativas = (
+        ["EleutherAI/lambada_openai"] if name == "lambada" else []
+    ) + (
+        ["cais/mmlu"] if name == "mmlu" else []
+    ) + (
+        ["Salesforce/wikitext"] if name == "wikitext" else []
+    )
+    erros = []
+    for cand in tentativas:
+        for cfg in ((kw.get("config"), None) if kw.get("config") else (None,)):
+            try:
+                return load_dataset(cand, cfg, split=split) if cfg else \
+                       load_dataset(cand, split=split)
+            except Exception as e:
+                erros.append(f"{cand}/{cfg}: {type(e).__name__}: {str(e)[:110]}")
+    raise RuntimeError(" | ".join(erros))
+
+
 def task_mmlu(arm, n=200, seed=0, rows=None):
     """MMLU zero-shot, amostra estável por conteúdo. Devolve lista de 2 resultados."""
     if rows is None:
-        from datasets import load_dataset
-        ds = load_dataset("cais/mmlu", "all", split="test")
-        rows = [{"question": ds[i]["question"], "choices": list(ds[i]["choices"]),
-                 "answer": int(ds[i]["answer"])} for i in range(len(ds))]
+        try:
+            ds = load_rows("mmlu", config="all")
+            rows = [{"question": ds[i]["question"], "choices": list(ds[i]["choices"]),
+                     "answer": int(ds[i]["answer"])} for i in range(len(ds))]
+            src = "cais/mmlu all/test"
+        except Exception as e:
+            msg = str(e)[:200]
+            return [{"task": f"mmlu/{t}", "status": "erro", "dtype": arm.dtype,
+                     "erro": msg, "n": 0} for t in ("ll-raw", "ll-norm")]
+    else:
+        src = "fornecido pelo chamador"
     items = canonical_sample(rows, n, seed, key=lambda r: r["question"])
     out = _mcq(arm, items, "mmlu")
     for r in out:
         r["itens_hash"] = fingerprint([i["question"] for i in items])
-        r["fonte"] = f"cais/mmlu all/test, amostra n={len(items)} seed={seed}"
+        r["fonte"] = f"{src}, amostra n={len(items)} seed={seed}"
     return out
 
 
 def task_lambada(arm, n=200, seed=0, rows=None):
+    """LAMBADA: prever a última palavra. Falha de dataset vira status, não exceção."""
     if rows is None:
-        from datasets import load_dataset
-        ds = load_dataset("lambada", "plain_text", split="test")
-        rows = [{"text": ds[i]["text"]} for i in range(len(ds))]
+        try:
+            ds = load_rows("lambada", config="plain_text")
+            rows = [{"text": ds[i]["text"]} for i in range(len(ds))]
+        except Exception as e:
+            return {"task": "lambada", "status": "erro", "dtype": arm.dtype,
+                    "acc": None, "acc_ci95": [None, None], "acertos": 0, "n": 0,
+                    "erro": str(e)[:200],
+                    "nota": "dataset indisponivel — a tarefa NAO rodou, o que e "
+                            "diferente de acuracia zero"}
     items = canonical_sample(rows, n, seed, key=lambda r: r["text"])
     hits, n_, skip = 0, 0, 0
     for it in items:
