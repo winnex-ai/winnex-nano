@@ -552,7 +552,18 @@ namespace {
 struct ThreadCap {
     ThreadCap() {
         if (std::getenv("OMP_NUM_THREADS") != nullptr) return;  // caller decides
+#ifdef _OPENMP
+        // `omp_set_num_threads` só existe quando OpenMP foi encontrado. O
+        // CMakeLists trata OpenMP como OPCIONAL (o Apple Clang não traz
+        // libomp, e exigi-lo quebrava o runner do macOS), mas esta chamada
+        // não estava guardada: numa build sem OpenMP o símbolo não resolve e
+        // o LINK falha — que é exatamente o que aconteceu no macos-14 da
+        // 0.1.35, enquanto Windows e Linux passavam.
+        //
+        // Sem OpenMP a build é single-thread, então o teto não tem o que
+        // limitar: não fazer nada é o comportamento correto, não uma perda.
         omp_set_num_threads(4);
+#endif
     }
 };
 ThreadCap g_thread_cap;
