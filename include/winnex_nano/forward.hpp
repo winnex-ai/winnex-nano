@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>   // std::pair — usado em profiling_by_tag(); não herdar de <vector>
 #include <vector>
 
 #include "winnex_nano/safetensors.hpp"

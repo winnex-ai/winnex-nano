@@ -1,3 +1,13 @@
+// Includes que este cabeçalho USA, não os que ele herda por acaso.
+//
+// Usa std::vector, std::string e std::pair. O `<vector>` foi adicionado na
+// 0.1.35 e o `<utility>` (que define std::pair) ficou de fora: compilava no
+// Linux porque a libstdc++ puxa `<utility>` por transitividade via `<vector>`,
+// e a libc++ do macOS não garante isso. O sintoma foi o build do macos-14
+// falhar enquanto Linux e Windows passavam — a assinatura de um include
+// herdado que nunca foi declarado.
+#include <string>
+#include <utility>
 #include <vector>
 // forward_gpu.hpp — OpenCL dense projections for the native forward pass.
 //
