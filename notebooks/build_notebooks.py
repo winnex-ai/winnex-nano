@@ -513,10 +513,16 @@ as falhas — que são resultado, não algo a omitir.
 
 No Kaggle ele fica em `/kaggle/working/` e aparece em *Output*.
 """), code(f"""import json, time, platform
+# O nome do braco e uma CONSTANTE do notebook, nao `arm.name`: a celula de
+# desempenho faz `del arm` para recarregar em bf16, e esta e a ultima celula.
+# A versao anterior usava arm.name e a exportacao morria com
+# `NameError: name 'arm' is not defined` DEPOIS de todas as medicoes prontas --
+# o run inteiro se perdia na gravacao do resultado.
+ARM = "{arm}"
 RES = [r_ppl, r_mmlu_raw, r_mmlu_norm, r_lambada, *r_prefill, *r_decode]
 saida = {{
-    "arm": arm.name,
-    "pacote": "winnex-nano {VERSAO}" if arm.name == "winnex-nano" else "transformers",
+    "arm": ARM,
+    "pacote": "winnex-nano {VERSAO}" if ARM == "winnex-nano" else "transformers",
     "modelo": MODELO_ID,
     "maquina": platform.platform(),
     "python": platform.python_version(),
