@@ -4,7 +4,14 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+// <omp.h> só existe quando OpenMP está disponível. O Apple Clang não traz
+// libomp, o CMakeLists trata OpenMP como opcional, e este include não estava
+// guardado — no macOS o header não existe e a COMPILAÇÃO falha, antes mesmo do
+// link que a guarda de `omp_set_num_threads` já resolveu. weight_balancer.cpp
+// fazia certo desde sempre; este arquivo não.
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
