@@ -1866,6 +1866,32 @@ std::vector<float> ForwardEngine::forward_next(const std::vector<float>& hidden)
         v_caches_[layer].resize((size_t)(ctx_len_ + 1) * kv_out);
     }
 
+    // A reserva do lado do DEVICE também precisa crescer, e só o prefill a
+    // fazia. O KV residente reserva `ctx_max` posições de uma vez, com margem
+    // de 256 sobre o prompt; quando o decode passava dessa margem,
+    // attention_resident() lançava out_of_range no meio da geração.
+    //
+    // Com o residente opt-in o caminho raramente era exercitado. Ao ligá-lo por
+    // padrão na 0.1.38, o kernel do Kaggle morreu em:
+    //
+    //   IndexError: ForwardGpu::attention_resident: context 512 exceeds reserved 306
+    //
+    // 306 = prompt de 50 tokens (prefill de paridade) + margem de 256, seguido
+    // de um prefill de 512 posições.
+    //
+    // prepare_kv() já sai cedo quando a capacidade existente basta, então
+    // consultar por token custa uma comparação no caso comum.
+    if (gpu_ != nullptr && gpu_->has_kv(0)) {
+        const int need = ctx_len_ + 1;
+        if (need > gpu_->kv_capacity()) {
+            const int max_pos = cfg_.max_position_embeddings > 0
+                                ? cfg_.max_position_embeddings : need;
+            gpu_->prepare_kv(std::min(max_pos, need + std::max(256, need / 2)),
+                             cfg_.num_key_value_heads, cfg_.head_dim,
+                             cfg_.num_hidden_layers);
+        }
+    }
+
     // Run a single token through all layers, attending to the full cache.
     std::vector<float> h = hidden;  // [1, H]
     for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {

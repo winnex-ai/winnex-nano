@@ -133,6 +133,17 @@ public:
     void release_kv();
     bool has_kv(int layer) const;
 
+    /**
+     * Quantas posições o cache residente comporta (0 quando não há cache).
+     *
+     * Existe porque `attention_resident` lança `out_of_range` quando o contexto
+     * passa da capacidade reservada, e o decode cresce um token por passo. Sem
+     * consultar isto, o chamador só descobre que precisa crescer quando a
+     * exceção já estourou no meio da geração — foi assim que o kernel do Kaggle
+     * morreu em "context 512 exceeds reserved 306".
+     */
+    int kv_capacity() const;
+
     void attention_resident(int layer, const float* Q,
                             const float* K, const float* V, float* O,
                             int seq, int nh, int nkv, int hd, int cache_pos);

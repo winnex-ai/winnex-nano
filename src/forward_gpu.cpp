@@ -1225,6 +1225,10 @@ bool ForwardGpu::has_kv(int layer) const {
            (size_t)layer < impl_->kv_k.size() && impl_->kv_k[(size_t)layer] != nullptr;
 }
 
+int ForwardGpu::kv_capacity() const {
+    return impl_ ? (int)impl_->kv_layer_cap : 0;
+}
+
 // Attention against the device-resident cache.
 //
 // `cache_pos` is the absolute position of the first row of K/V being supplied.
