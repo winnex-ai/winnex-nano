@@ -8,7 +8,9 @@
   "enable_gpu": true,
   "enable_tpu": false,
   "enable_internet": true,
-  "dataset_sources": [],
+  "dataset_sources": [
+    "kleniopadilha/winnex-parity-ref"
+  ],
   "kernel_sources": [],
   "competition_sources": [],
   "model_sources": []
