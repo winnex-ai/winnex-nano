@@ -1,0 +1,15 @@
+{
+  "id": "kleniopadilha/bench-winnex-nano-vs-transformers-winnex",
+  "title": "Bench winnex-nano vs transformers (winnex)",
+  "code_file": "bench_winnex_nano.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}
