@@ -1,0 +1,240 @@
+{
+  "arm": "winnex-nano",
+  "pacote": "winnex-nano 0.1.41",
+  "modelo": "Qwen/Qwen2.5-0.5B-Instruct",
+  "maquina": "Linux-6.18.55+-x86_64-with-glibc2.39",
+  "python": "3.13.15",
+  "data": "2026-10-25T17:41:23",
+  "tokenizer": {
+    "n_tokens": 35,
+    "hash": "34d472e24abe774c",
+    "ids_head": [
+      785,
+      3974,
+      13876,
+      38835,
+      34208,
+      916,
+      279,
+      15678
+    ]
+  },
+  "gate": {
+    "status": "nao_verificado",
+    "motivo": "referencia do outro braco ausente"
+  },
+  "memoria": {
+    "baseline": {
+      "rss_gb": 0.18996047973632812,
+      "anon_gb": 0.1569976806640625,
+      "vram_gb": 0.0
+    },
+    "carga": {
+      "load_s": 5.23,
+      "anon_delta_gb": 1.39,
+      "vram_delta_gb": 1.512
+    },
+    "pico": {
+      "anon_gb": 2.0165481567382812,
+      "rss_gb": 3.4301109313964844,
+      "vram_peak_gb": 1.42578125
+    },
+    "vazamento": {
+      "anon_gb": 1.8725929260253906,
+      "vram_gb": 0.30078125
+    }
+  },
+  "resultados": [
+    {
+      "task": "ppl/wikitext-2",
+      "status": "ok",
+      "dtype": "f32",
+      "ppl": 20.926798294637255,
+      "ppl_ci95": [
+        20.05085097053989,
+        21.832365884528194
+      ],
+      "n_tokens": 20440,
+      "n_janelas": 40,
+      "seq": 512,
+      "stride": 256,
+      "segundos": 180.3,
+      "nota": "IC bootstrap sobre tokens; janelas tem passo 256 e se sobrepoem em 50%"
+    },
+    {
+      "status": "ok",
+      "dtype": "f32",
+      "n": 200,
+      "itens_com_erro": 0,
+      "task": "mmlu/ll-raw",
+      "acc": 0.355,
+      "acc_ci95": [
+        0.29198518653239286,
+        0.42348015518392024
+      ],
+      "acertos": 71,
+      "nota": "log-verossimilhanca SOMADA, sem normalizar (protocolo MMLU classico); zero-shot; IC de Wilson",
+      "itens_hash": "31a349115f2fa003",
+      "fonte": "cais/mmlu all/test, amostra n=200 seed=0"
+    },
+    {
+      "status": "ok",
+      "dtype": "f32",
+      "n": 200,
+      "itens_com_erro": 0,
+      "task": "mmlu/ll-norm",
+      "acc": 0.285,
+      "acc_ci95": [
+        0.22694905173277294,
+        0.3511547308121051
+      ],
+      "acertos": 57,
+      "nota": "mesmos scores divididos pelo numero de tokens da alternativa (variante, NAO e o numero publicado); IC de Wilson",
+      "itens_hash": "31a349115f2fa003",
+      "fonte": "cais/mmlu all/test, amostra n=200 seed=0"
+    },
+    {
+      "task": "lambada",
+      "status": "ok",
+      "dtype": "f32",
+      "acc": 0.44,
+      "acc_ci95": [
+        0.37297700420582364,
+        0.509284516504375
+      ],
+      "acertos": 88,
+      "n": 200,
+      "pulados": 0,
+      "itens_hash": "3925d8df4d2760bd",
+      "fonte": "lambada plain_text, amostra n=200 seed=0",
+      "nota": "argmax exato do primeiro token do alvo; IC de Wilson"
+    },
+    {
+      "n": 10,
+      "mean_ms": 2711.27,
+      "median_ms": 2710.716,
+      "p99_ms": 2740.32,
+      "iqr_ms": 20.35,
+      "min_ms": 2686.432,
+      "max_ms": 2740.732,
+      "ruido_rel": 0.0109,
+      "task": "prefill",
+      "status": "ok",
+      "dtype": "bf16",
+      "n_tokens": 512,
+      "iters": 10,
+      "warmup": 2,
+      "ttft_ms": 2710.716,
+      "tok_per_s": 188.9
+    },
+    {
+      "n": 10,
+      "mean_ms": 5809.645,
+      "median_ms": 5809.143,
+      "p99_ms": 5831.938,
+      "iqr_ms": 13.033,
+      "min_ms": 5795.563,
+      "max_ms": 5833.405,
+      "ruido_rel": 0.0039,
+      "task": "prefill",
+      "status": "ok",
+      "dtype": "bf16",
+      "n_tokens": 1024,
+      "iters": 10,
+      "warmup": 2,
+      "ttft_ms": 5809.143,
+      "tok_per_s": 176.3
+    },
+    {
+      "n": 10,
+      "mean_ms": 13149.513,
+      "median_ms": 13147.1,
+      "p99_ms": 13205.006,
+      "iqr_ms": 20.895,
+      "min_ms": 13122.986,
+      "max_ms": 13208.328,
+      "ruido_rel": 0.0044,
+      "task": "prefill",
+      "status": "ok",
+      "dtype": "bf16",
+      "n_tokens": 2048,
+      "iters": 10,
+      "warmup": 2,
+      "ttft_ms": 13147.1,
+      "tok_per_s": 155.8
+    },
+    {
+      "task": "prefill/decomposicao",
+      "status": "ok",
+      "dtype": "bf16",
+      "custo_fixo_ms": -958.26,
+      "custo_por_token_ms": 6.8476,
+      "r2": 0.99838,
+      "nota": "ajuste TTFT(n) = fixo + marginal*n; r2 baixo = o modelo linear nao descreve"
+    },
+    {
+      "n": 10,
+      "mean_ms": 27.613,
+      "median_ms": 27.399,
+      "p99_ms": 28.404,
+      "iqr_ms": 0.862,
+      "min_ms": 27.167,
+      "max_ms": 28.413,
+      "ruido_rel": 0.0367,
+      "task": "decode",
+      "status": "ok",
+      "dtype": "bf16",
+      "ctx": 128,
+      "n_gen": 128,
+      "iters": 10,
+      "warmup": 2,
+      "batch": 1,
+      "itl_ms": 27.399,
+      "tok_per_s": 36.5
+    },
+    {
+      "n": 10,
+      "mean_ms": 29.459,
+      "median_ms": 29.414,
+      "p99_ms": 30.222,
+      "iqr_ms": 0.597,
+      "min_ms": 28.955,
+      "max_ms": 30.258,
+      "ruido_rel": 0.0275,
+      "task": "decode",
+      "status": "ok",
+      "dtype": "bf16",
+      "ctx": 512,
+      "n_gen": 128,
+      "iters": 10,
+      "warmup": 2,
+      "batch": 1,
+      "itl_ms": 29.414,
+      "tok_per_s": 34.0
+    },
+    {
+      "n": 10,
+      "mean_ms": 31.094,
+      "median_ms": 31.1,
+      "p99_ms": 31.5,
+      "iqr_ms": 0.352,
+      "min_ms": 30.755,
+      "max_ms": 31.522,
+      "ruido_rel": 0.0129,
+      "task": "decode",
+      "status": "ok",
+      "dtype": "bf16",
+      "ctx": 1024,
+      "n_gen": 128,
+      "iters": 10,
+      "warmup": 2,
+      "batch": 1,
+      "itl_ms": 31.1,
+      "tok_per_s": 32.15
+    }
+  ],
+  "resumo_falhas": {
+    "n": 0,
+    "itens": []
+  }
+}
