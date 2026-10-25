@@ -66,8 +66,24 @@ namespace {
 // o host e o kernel usem o MESMO número: o elenco do grid no host e o
 // reqd_work_group_size do kernel têm que concordar, e dois literais separados
 // divergem sem erro de compilação.
-constexpr int kAttTg = 64;      // work-items por linha de atenção
-constexpr int kAttHdMax = 128;  // maior head_dim que cabe no tile local
+// 32 e não 64: o tile local é s_o[ATT_TG][ATT_HD_MAX], ou seja
+// ATT_TG · ATT_HD_MAX · 4 bytes. Com TG=64 e HD_MAX=128 isso dá 32 KB de
+// __local — acima do mínimo que o OpenCL garante (16 KB) e acima do limite de
+// várias GPUs integradas e do que o driver de macOS expõe. O kernel compilava
+// no NVIDIA (48 KB disponíveis) e falhava em outros.
+//
+// Com TG=32 o tile cai para 16 KB, que é o piso garantido pela especificação.
+// O custo medido é pequeno: o ganho vem de paralelizar sobre as chaves, e 32
+// work-items por linha já satura a placa para ctx=512.
+constexpr int kAttTg = 32;      // work-items por linha de atenção
+constexpr int kAttHdMax = 128;  // maior head_dim que cabe no tile local (16 KB)
+
+// Bytes de __local que o kernel exige. O construtor compara com
+// CL_DEVICE_LOCAL_MEM_SIZE do dispositivo e descarta o kernel paralelo se não
+// couber — em vez de deixar o clBuildProgram falhar no carregamento do módulo
+// e derrubar o `import` inteiro.
+constexpr size_t kAttLocalBytes = (size_t)kAttTg * kAttHdMax * sizeof(float)
+                                + 2 * kAttTg * sizeof(float);
 
 // The function pointers we resolve. The types come from the real CL headers,
 // so a signature drift is a compile error rather than silent corruption.
@@ -386,9 +402,10 @@ void gemm_bias_bf16(
 // CL_KERNEL_WORK_GROUP_SIZE do kernel compilado e o compara com kAttTg. Sem
 // essa checagem, mudar um lado faz o host elencar um grid que não é o do
 // kernel, e o resultado fica errado sem erro nenhum.
-#define ATT_TG 64
+#define ATT_TG 32
 #define ATT_HD_MAX 128
 
+//__ATT_SPLIT_MARKER__
 __kernel __attribute__((reqd_work_group_size(ATT_TG, 1, 1)))
 void attention_split(
     __global const float* Q,      // [seq, nh, hd]
@@ -891,7 +908,40 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
     if (err != CL_SUCCESS || !impl_->q)
         throw std::runtime_error("ForwardGpu: clCreateCommandQueue failed (" + std::to_string(err) + ")");
 
-    const char* src = kGemmSrc;
+    // O kernel paralelo de atenção pede kAttLocalBytes de __local. Se o
+    // dispositivo não tiver esse espaço, incluí-lo no programa faz o
+    // clBuildProgram FALHAR POR INTEIRO e o construtor lançar — nenhum kernel
+    // carrega, e o módulo não abre. Um kernel de desempenho não pode derrubar
+    // o módulo por não caber num dispositivo; ele deve simplesmente não ser
+    // oferecido. Por isso o programa é montado com a diretiva ligada ou
+    // desligada, conforme o dispositivo declare ter espaço.
+    size_t dev_local = 0;
+    {
+        size_t got = 0;
+        g_api->clGetDeviceInfo(dev, CL_DEVICE_LOCAL_MEM_SIZE,
+                               sizeof(dev_local), &dev_local, &got);
+    }
+    const bool want_split = dev_local == 0 || dev_local >= kAttLocalBytes;
+    std::string prog_src;
+    {
+        const char* marker = "//__ATT_SPLIT_MARKER__";
+        std::string base(kGemmSrc);
+        size_t pos = base.find(marker);
+        if (pos == std::string::npos) {
+            prog_src = base;  // sem marcação: inclui tudo (o caso anterior)
+        } else if (want_split) {
+            prog_src = base.substr(0, pos) + base.substr(pos + std::strlen(marker));
+        } else {
+            // remove o kernel: corta da marcação até o próximo kernel
+            size_t end = base.find("__kernel", pos + std::strlen(marker));
+            prog_src = base.substr(0, pos) + (end == std::string::npos ? "" : base.substr(end));
+            g_reason = "attention_split omitido: __local exigido " +
+                       std::to_string(kAttLocalBytes / 1024) + " KB > dispositivo " +
+                       std::to_string(dev_local / 1024) + " KB";
+        }
+    }
+
+    const char* src = prog_src.c_str();
     impl_->prog = g_api->clCreateProgramWithSource(impl_->ctx, 1, &src, nullptr, &err);
     if (err != CL_SUCCESS || !impl_->prog)
         throw std::runtime_error("ForwardGpu: clCreateProgramWithSource failed");
