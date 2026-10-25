@@ -609,7 +609,13 @@ float ForwardEngine::RoPEInvFreq(int j) const {
                                     : cfg_.max_position_embeddings);
     const double low_wavelen = old_ctx / lo_f;
     const double high_wavelen = old_ctx / hi_f;
-    const double wavelen = 2.0 * M_PI / inv;
+    // pi como literal, não M_PI: `M_PI` não existe no MSVC sem
+    // `_USE_MATH_DEFINES`, e o padrão C++ não a exige em <cmath>. O build
+    // quebrou no runner do Windows por causa desta linha — o Linux passou e
+    // o macOS/Windows não, que é a assinatura de uma macro POSIX usada como
+    // se fosse padrão.
+    constexpr double kPi = 3.14159265358979323846;
+    const double wavelen = 2.0 * kPi / inv;
 
     double inv_llama = (wavelen > low_wavelen) ? inv / factor : inv;
     if (!(wavelen < high_wavelen) && !(wavelen > low_wavelen)) {
