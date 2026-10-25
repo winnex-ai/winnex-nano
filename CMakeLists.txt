@@ -176,13 +176,44 @@ if(WINNEX_NANO_BUILD_TESTS)
     target_link_libraries(test_x_factor PRIVATE winnex_nano)
     add_test(NAME x_factor COMMAND test_x_factor)
 
+    # test_safetensors exige o caminho de um .safetensors. Ele estava
+    # registrado sem argumento, então o CTest o invocava sem modelo, o
+    # programa imprimia "usage: ..." e saía com código diferente de zero: um
+    # teste permanentemente vermelho que não testava nada. Entra na mesma
+    # condição do forward — só quando há checkpoint configurado.
     add_executable(test_safetensors tests/test_safetensors.cpp)
     target_link_libraries(test_safetensors PRIVATE winnex_nano)
-    add_test(NAME safetensors COMMAND test_safetensors)
+    if(DEFINED WINNEX_TEST_MODEL_DIR AND EXISTS "${WINNEX_TEST_MODEL_DIR}/model.safetensors")
+        add_test(NAME safetensors
+                 COMMAND test_safetensors "${WINNEX_TEST_MODEL_DIR}/model.safetensors")
+    else()
+        message(STATUS "winnex-nano: test_safetensors nao registrado "
+                       "(defina WINNEX_TEST_MODEL_DIR para ativar)")
+    endif()
 
-    # test_forward requires a model dir (config.json + model.safetensors); the
-    # test is registered but the model is passed via command line (not a CTest
-    # arg — run it manually with `./test_forward <model_dir> <prompt>`).
+    # test_forward precisa de um checkpoint real. O caminho vem de
+    # WINNEX_TEST_MODEL_DIR; sem ele o teste NÃO é registrado, em vez de ser
+    # registrado e passar sem verificar nada — que era o estado anterior
+    # (imprimia logits, não tinha asserção, e testava um caminho que a geração
+    # não usa).
+    #
+    #   WINNEX_TEST_MODEL_DIR=/caminho/Qwen2.5-0.5B-Instruct \
+    #     cmake -DWINNEX_TEST_MODEL_DIR=$WINNEX_TEST_MODEL_DIR ...
+    #   ./test_forward $WINNEX_TEST_MODEL_DIR --record   # uma vez, commita o .bin
+    #
+    # A referência (forward_reference.bin) é gerada pela CPU em f32, então o
+    # CI compara álgebra sem precisar de PyTorch.
     add_executable(test_forward tests/test_forward.cpp)
     target_link_libraries(test_forward PRIVATE winnex_nano)
+    if(DEFINED WINNEX_TEST_MODEL_DIR AND EXISTS "${WINNEX_TEST_MODEL_DIR}/config.json")
+        add_test(NAME forward_golden
+                 COMMAND test_forward "${WINNEX_TEST_MODEL_DIR}")
+        set_tests_properties(forward_golden PROPERTIES
+            # rc=3 = referencia ausente. Falha, nao passa: um gate que nao
+            # pode verificar tem que ser visivel.
+            FAIL_REGULAR_EXPRESSION "FALHOU|SEM REFERENCIA|ERROR")
+    else()
+        message(STATUS "winnex-nano: test_forward nao registrado "
+                       "(defina WINNEX_TEST_MODEL_DIR para ativar)")
+    endif()
 endif()
