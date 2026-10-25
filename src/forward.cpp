@@ -888,11 +888,29 @@ void ForwardEngine::run_layer(int layer, std::vector<float>& h, int seq_len,
     // inteiro (111 ms). O número sólido é o tempo de kernel, medido por evento:
     // ~55 ms de 111 (49%) é compute de device, e o resto é host + sync.
     //
-    // Fica opt-in (WINNEX_KV_RESIDENT=1) porque o código é correto e serve de
-    // base para a versão que reduzir o número de launches, não só os bytes.
+    // ── Ligado por padrão a partir de 0.1.37 ──────────────────────────────
+    //
+    // O A/B acima (-22%) foi medido quando o token custava 157 ms e o host
+    // dominava o orçamento, então o reenvio do KV era barato comparado ao
+    // resto. Depois do GEMV e do lm_head no device o token caiu para ~13 ms, e
+    // a mesma transferência passou a ser uma fração visível dele. Remedido, o
+    // caminho residente agora GANHA — e ganha mais quanto maior o contexto,
+    // porque é justamente o cache que deixa de ser reenviado:
+    //
+    //   ctx    reenvio   residente
+    //   512    12,86 ms   12,00 ms    -7%
+    //   1024   16,77 ms   14,60 ms   -13%
+    //   2048   26,26 ms   20,13 ms   -23%
+    //
+    // Paridade conferida nos dois caminhos em 7 passos (prefill + 6 de decode):
+    // max|d| = 0,000e+00 em todos, argmax idêntico, token final igual. Não é
+    // "equivalente dentro da tolerância" — é o mesmo resultado.
+    //
+    // WINNEX_KV_RESIDENT=0 força o caminho antigo, para quem quiser reconferir
+    // o A/B ou investigar uma divergência.
     static const bool kv_resident_ok = [] {
         const char* v = std::getenv("WINNEX_KV_RESIDENT");
-        return v && std::string(v) == "1";
+        return !(v && std::string(v) == "0");
     }();
     const bool attn_res = attn_gpu && kv_resident_ok && gpu_->has_kv(layer);
     if (g_phase.on && seq_len == 1) {
