@@ -303,6 +303,23 @@ for c in CAND:
             break
 GATE = bench_core.compare_parity(PAR, REF)
 print("\\nGATE:", json.dumps(GATE, indent=2))
+if GATE["status"] == "nao_verificado":
+    # Os dois kernels rodam em containers SEPARADOS: o arquivo do outro braco
+    # nunca esta aqui, a menos que alguem o anexe como dataset. Sem isso o gate
+    # e um controle que parece rigoroso e nao verifica nada — foi o que
+    # aconteceu nas rodadas anteriores, nos dois bracos.
+    #
+    # O que da para fazer dentro de um kernel so: conferir que a numeracao de
+    # tokens e identica a do transformers. Se a PPL e as acuracias coincidirem
+    # no nivel de 1e-7 no relatorio final, a algebra bateu; mas isso e
+    # inferencia, nao medicao direta. Este aviso existe para que a diferenca
+    # fique visivel em vez de virar um "passou" silencioso.
+    print("\\nAVISO: gate NAO VERIFICADO — o outro braco roda em outro container.")
+    print(f"  Para verificar de verdade: anexe o resultado_*.json do outro braco")
+    print(f"  como input do dataset e rode de novo. O arquivo deste braco e")
+    print(f"  'referencia_paridade.json', com hash {PAR['prompt_hash']},")
+    print(f"  {len(PAR['tokens'])} tokens gerados a partir de {PAR['prompt_len']} de prompt.")
+    print(f"  O relatorio final NAO deve tratar isto como paridade confirmada.")
 if GATE["status"] == "falhou":
     raise AssertionError(f"GATE FALHOU: diverge no token {GATE['primeira_divergencia']} "
                          f"({GATE['identicos']}/{GATE['n']} identicos)")
