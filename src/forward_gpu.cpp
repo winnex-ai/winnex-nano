@@ -644,6 +644,62 @@ void gemv_bias(
         C[row] = v;
     }
 }
+
+// ── GEMV bf16 ─────────────────────────────────────────────────────────────
+//
+// O gêmeo bf16 do kernel acima. Existe porque o benchmark mede em bf16 (é o
+// dtype que cabe nos 7B/14B) e o GEMV f32 não é usado nesse caminho — então o
+// decode em bf16 continuava no GEMM tiled, a 16% do pico.
+//
+// Medido no Kaggle, que é onde isso importa: com o GEMV f32 o decode dava
+// 12,4 ms/token em f32 mas 38,7 em bf16 — e o braço medido é bf16.
+//
+// W vem como ushort (bf16); a conversão para f32 é o deslocamento de 16 bits
+// para a metade alta, sem arredondamento — o mesmo tratamento do
+// gemm_bias_bf16, para que os dois caminhos produzam o mesmo número.
+__kernel __attribute__((reqd_work_group_size(GEMV_WG, 1, 1)))
+void gemv_bias_bf16(
+    __global const float* A,      // [seq, in]  (seq == 1), sempre f32
+    __global const ushort* W,     // [out, in] bf16
+    __global const float* bias,   // [out]
+    __global float* C,            // [seq, out]
+    int in_dim, int out_dim, int has_bias)
+{
+    __local float red[GEMV_WG];
+    const int row  = (int)get_group_id(0);
+    const int lane = (int)get_local_id(0);
+
+    float acc = 0.0f;
+    if (row < out_dim) {
+        __global const ushort* wr = W + (size_t)row * in_dim;
+        __global const float* ar = A;
+        // in_dim é múltiplo de 4 (condição de despacho), então o passo de 4
+        // nunca passa do fim. Ler em grupos de 4 ushort mantém a transação
+        // contígua: 8 bytes por thread, 512 por work-group de 64 lanes.
+        const int nv = in_dim >> 2;
+        for (int i = lane; i < nv; i += GEMV_WG) {
+            const int k = i << 2;
+            float4 w;
+            w.x = as_float((uint)wr[k + 0] << 16);
+            w.y = as_float((uint)wr[k + 1] << 16);
+            w.z = as_float((uint)wr[k + 2] << 16);
+            w.w = as_float((uint)wr[k + 3] << 16);
+            float4 a = vload4(0, ar + k);
+            acc += w.x * a.x + w.y * a.y + w.z * a.z + w.w * a.w;
+        }
+    }
+    red[lane] = acc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = GEMV_WG / 2; s > 0; s >>= 1) {
+        if (lane < s) red[lane] += red[lane + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lane == 0 && row < out_dim) {
+        float v = red[0];
+        if (has_bias) v += bias[row];
+        C[row] = v;
+    }
+}
 )";
 
 } // namespace
@@ -656,7 +712,8 @@ struct ForwardGpu::Impl {
     cl_program prog = nullptr;
     cl_kernel k_gemm = nullptr;
     cl_kernel k_gemm_bf16 = nullptr;
-    cl_kernel k_gemv = nullptr;   // seq==1: 5,9x o GEMM tiled (ver kGemvSrc)
+    cl_kernel k_gemv = nullptr;   // seq==1, f32: 5,9x o GEMM tiled (ver kGemvSrc)
+    cl_kernel k_gemv_bf16 = nullptr;  // seq==1, bf16: o caminho que o Kaggle mede
     cl_kernel k_attn = nullptr;
     cl_kernel k_attn_split = nullptr;
     cl_kernel k_attn_res = nullptr;
@@ -918,6 +975,7 @@ struct ForwardGpu::Impl {
         if (k_gemm) g_api->clReleaseKernel(k_gemm);
         if (k_gemm_bf16) g_api->clReleaseKernel(k_gemm_bf16);
         if (k_gemv) g_api->clReleaseKernel(k_gemv);
+        if (k_gemv_bf16) g_api->clReleaseKernel(k_gemv_bf16);
         if (k_attn) g_api->clReleaseKernel(k_attn);
         if (k_attn_split) g_api->clReleaseKernel(k_attn_split);
         if (q_buf) g_api->clReleaseMemObject(q_buf);
@@ -1076,6 +1134,8 @@ ForwardGpu::ForwardGpu(const std::string& opencl_lib) : impl_(new Impl) {
     // dependência de boot.
     impl_->k_gemv = g_api->clCreateKernel(impl_->prog, "gemv_bias", &err);
     if (err != CL_SUCCESS) impl_->k_gemv = nullptr;
+    impl_->k_gemv_bf16 = g_api->clCreateKernel(impl_->prog, "gemv_bias_bf16", &err);
+    if (err != CL_SUCCESS) impl_->k_gemv_bf16 = nullptr;
 
     g_reason = std::string("ok: ") + impl_->dev_name;
 }
@@ -1439,8 +1499,11 @@ void ForwardGpu::matmul_device(const char* tag, const float* A, int seq,
     // A faixa "seq <= 16" que eu havia escrito generalizava indevidamente a
     // medição de reqd_work_group_size. O decode é seq==1 e isso é tudo o que
     // este kernel precisa cobrir.
-    const bool use_gemv = impl_->k_gemv && !is_bf16 && seq == 1 &&
-                          (in_dim % 4) == 0;
+    // Há uma variante por dtype. O bf16 existe porque o benchmark mede bf16
+    // (é o dtype que cabe nos modelos maiores) e, sem ele, o decode em bf16
+    // ficava no GEMM tiled a 16% do pico enquanto o f32 ia a 95%.
+    cl_kernel gemv_k = is_bf16 ? impl_->k_gemv_bf16 : impl_->k_gemv;
+    const bool use_gemv = gemv_k && seq == 1 && (in_dim % 4) == 0;
     cl_event ev_k = nullptr;
     const bool prof = g_api->clGetEventProfilingInfo && g_prof.on;
 
@@ -1454,7 +1517,7 @@ void ForwardGpu::matmul_device(const char* tag, const float* A, int seq,
             {6, sizeof(int), &has_bias},
         };
         for (auto& e : ga) {
-            const cl_int e2 = g_api->clSetKernelArg(impl_->k_gemv, e.i, e.sz, e.p);
+            const cl_int e2 = g_api->clSetKernelArg(gemv_k, e.i, e.sz, e.p);
             if (e2 != CL_SUCCESS)
                 throw std::runtime_error("ForwardGpu: clSetKernelArg gemv(" +
                                          std::to_string(e.i) + ") failed (" +
@@ -1462,7 +1525,7 @@ void ForwardGpu::matmul_device(const char* tag, const float* A, int seq,
         }
         const size_t gsz1[1] = {(size_t)out_dim * GEMV_WG};
         const size_t lws1[1] = {(size_t)GEMV_WG};
-        err = g_api->clEnqueueNDRangeKernel(impl_->q, impl_->k_gemv, 1, nullptr,
+        err = g_api->clEnqueueNDRangeKernel(impl_->q, gemv_k, 1, nullptr,
                                             gsz1, lws1, 0, nullptr, prof ? &ev_k : nullptr);
     } else {
         Impl::set_args_checked(kern, ba, bw, bb, bc, seq, in_dim, out_dim, has_bias);
@@ -1476,7 +1539,8 @@ void ForwardGpu::matmul_device(const char* tag, const float* A, int seq,
         throw std::runtime_error("ForwardGpu: enqueue failed (" + std::to_string(err) +
             ") tag=" + (tag ? tag : "?") + " seq=" + std::to_string(seq) +
             " in=" + std::to_string(in_dim) + " out=" + std::to_string(out_dim) +
-            " bias=" + std::to_string(has_bias) + " bf16=" + std::to_string((int)is_bf16));
+            " bias=" + std::to_string(has_bias) + " bf16=" + std::to_string((int)is_bf16) +
+            " gemv=" + std::to_string((int)use_gemv));
     g_api->clEnqueueReadBuffer(impl_->q, bc, CL_TRUE, 0, c_bytes, C, 0, nullptr, nullptr);
     // ── clFinish: o teste A/B ────────────────────────────────────────────
     //
