@@ -433,49 +433,69 @@ def task_ppl(arm, seq=512, stride=256, n_windows=40):
             "nota": "IC bootstrap sobre tokens; janelas tem passo 256 e se sobrepoem em 50%"}
 
 
-def _mcq(arm, items, name, normalize):
-    hits, n, erros = 0, 0, 0
+def _mcq(arm, items, name):
+    """As DUAS leituras do MMLU numa passagem só.
+
+    `ll-raw` (soma crua, protocolo clássico) e `ll-norm` (média por token,
+    variante) saem dos MESMOS scores por alternativa. Rodar a tarefa duas
+    vezes para obter as duas lê a mesma coisa duas vezes: no braço do winnex
+    isso custa 800 forwards e ~11 min no Kaggle, para produzir um segundo
+    número que é uma divisão do primeiro.
+
+    Devolve uma lista com os dois resultados, mais a contagem de itens que
+    falharam — que é resultado, não algo a descartar.
+    """
+    hit_raw = hit_norm = n = erros = 0
     for it in items:
         q = it["question"].strip()
-        sc = []
+        raw, norm = [], []
         for ch in it["choices"]:
             prompt = arm.encode(q + "\nAnswer:", False)
             cont = arm.encode(" " + ch.strip(), False)
             ids = prompt + cont
             if len(ids) < 2 or len(ids) > arm.max_ctx - 2:
-                sc.append(-1e30)
+                raw.append(-1e30)
+                norm.append(-1e30)
                 continue
             ls = _logrow(arm.logits_all(ids)[:-1])
             s = sum(float(ls[len(prompt) - 1 + j, cont[j]]) for j in range(len(cont)))
-            sc.append(s / max(1, len(cont)) if normalize else s)
-        if not sc or len(sc) != len(it["choices"]):
+            raw.append(s)
+            norm.append(s / max(1, len(cont)))
+        if not raw or len(raw) != len(it["choices"]):
             erros += 1
             continue
-        hits += int(int(np.argmax(sc)) == it["answer"])
+        hit_raw += int(int(np.argmax(raw)) == it["answer"])
+        hit_norm += int(int(np.argmax(norm)) == it["answer"])
         n += 1
-    lo, hi = wilson(hits, n)
-    return {"task": f"{name}/{'ll-norm' if normalize else 'll-raw'}",
-            "status": "ok" if n else "erro", "dtype": arm.dtype,
-            "acc": hits / n if n else None, "acc_ci95": [lo, hi],
-            "acertos": hits, "n": n, "itens_com_erro": erros,
-            "nota": ("log-verossimilhanca "
-                     + ("media por token (variante)" if normalize
-                        else "somada, sem normalizar (protocolo MMLU classico)")
-                     + "; zero-shot; IC de Wilson")}
+    lo, hi = wilson(hit_raw, n)
+    lo2, hi2 = wilson(hit_norm, n)
+    base = {"status": "ok" if n else "erro", "dtype": arm.dtype,
+            "n": n, "itens_com_erro": erros}
+    return [
+        dict(base, task=f"{name}/ll-raw", acc=hit_raw / n if n else None,
+             acc_ci95=[lo, hi], acertos=hit_raw,
+             nota="log-verossimilhanca SOMADA, sem normalizar (protocolo MMLU "
+                  "classico); zero-shot; IC de Wilson"),
+        dict(base, task=f"{name}/ll-norm", acc=hit_norm / n if n else None,
+             acc_ci95=[lo2, hi2], acertos=hit_norm,
+             nota="mesmos scores divididos pelo numero de tokens da alternativa "
+                  "(variante, NAO e o numero publicado); IC de Wilson"),
+    ]
 
 
-def task_mmlu(arm, n=200, seed=0, normalize=True, rows=None):
-    """MMLU zero-shot por log-verossimilhança, com amostra estável por conteúdo."""
+def task_mmlu(arm, n=200, seed=0, rows=None):
+    """MMLU zero-shot, amostra estável por conteúdo. Devolve lista de 2 resultados."""
     if rows is None:
         from datasets import load_dataset
         ds = load_dataset("cais/mmlu", "all", split="test")
         rows = [{"question": ds[i]["question"], "choices": list(ds[i]["choices"]),
                  "answer": int(ds[i]["answer"])} for i in range(len(ds))]
     items = canonical_sample(rows, n, seed, key=lambda r: r["question"])
-    r = _mcq(arm, items, "mmlu", normalize)
-    r["itens_hash"] = fingerprint([i["question"] for i in items])
-    r["fonte"] = f"cais/mmlu all/test, amostra n={len(items)} seed={seed}"
-    return r
+    out = _mcq(arm, items, "mmlu")
+    for r in out:
+        r["itens_hash"] = fingerprint([i["question"] for i in items])
+        r["fonte"] = f"cais/mmlu all/test, amostra n={len(items)} seed={seed}"
+    return out
 
 
 def task_lambada(arm, n=200, seed=0, rows=None):

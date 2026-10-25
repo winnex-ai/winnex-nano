@@ -344,9 +344,12 @@ a comparação é entre tarefas diferentes, e o JSON mostra isso.
 n={N_MMLU} dá IC de cerca de ±6 pontos numa acurácia perto de 35%. Diferenças
 menores não são detectáveis.
 """), code(f"""import bench_core
-r_mmlu_raw  = bench_core.task_mmlu(arm, n={N_MMLU}, seed={SEED}, normalize=False)
-r_mmlu_norm = bench_core.task_mmlu(arm, n={N_MMLU}, seed={SEED}, normalize=True)
-r_lambada   = bench_core.task_lambada(arm, n={N_LAMBADA}, seed={SEED})
+# UMA passagem: as duas leituras do MMLU saem dos mesmos scores. Rodar a
+# tarefa duas vezes recomputaria os mesmos forwards para produzir um numero
+# que e uma divisao do primeiro.
+r_mmlu = bench_core.task_mmlu(arm, n={N_MMLU}, seed={SEED})
+r_mmlu_raw, r_mmlu_norm = r_mmlu[0], r_mmlu[1]
+r_lambada = bench_core.task_lambada(arm, n={N_LAMBADA}, seed={SEED})
 for r in (r_mmlu_raw, r_mmlu_norm, r_lambada):
     lo, hi = r["acc_ci95"]
     print(f"  {{r['task']:<16}} {{r['acc']*100:5.1f}}%  n={{r['n']:<4}} "
