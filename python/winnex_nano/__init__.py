@@ -58,6 +58,12 @@ from .tokenize_engine import (
     EngineTokenizeReport,
     TokenAttribution,
     SegmentationReport,
+    # Artefato por MODELO: o binding C++ sempre os expôs, mas o __init__ não os
+    # reexportava — a funcionalidade existia no .so e era inalcançável em
+    # Python. PeGO pelo teste `test_pacote_publicado.py` na validação do 0.1.44.
+    TokenizerArtifact,
+    ModelIdentity,
+    verify_artifact_matches,
 )
 from .model_fusion import (
     linear_merge,
@@ -106,6 +112,9 @@ __all__ = [
     "EngineTokenizerOptions",
     "EngineTokenizeReport",
     "TokenAttribution",
+    "TokenizerArtifact",
+    "ModelIdentity",
+    "verify_artifact_matches",
     "SegmentationReport",
     "linear_merge",
     "slerp_merge",

@@ -39,6 +39,14 @@ from ._winnex_nano import (  # noqa: F401
     EngineTokenizerOptions,
     EngineTokenizeReport,
     TokenAttribution,
+    # Persistencia POR MODELO. Ficou de fora da primeira exportacao: o binding
+    # C++ expunha TokenizerArtifact/ModelIdentity/verify_artifact_matches, mas
+    # nem este modulo nem o __init__ os reexportavam — entao a funcionalidade
+    # existia no .so e era inalcancavel em Python. Medido ao validar o 0.1.44:
+    # `from winnex_nano import TokenizerArtifact` -> ImportError.
+    TokenizerArtifact,
+    ModelIdentity,
+    verify_artifact_matches,
 )
 
 __all__ = [
@@ -46,6 +54,9 @@ __all__ = [
     "EngineTokenizerOptions",
     "EngineTokenizeReport",
     "TokenAttribution",
+    "TokenizerArtifact",
+    "ModelIdentity",
+    "verify_artifact_matches",
     "SegmentationReport",
 ]
 

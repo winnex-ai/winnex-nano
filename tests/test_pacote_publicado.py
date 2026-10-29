@@ -26,16 +26,25 @@ import pytest
 
 
 def test_engine_tokenizer_esta_no_pacote_instalado():
-    """`import winnex_nano` tem de expor o tokenizer do motor."""
+    """`import winnex_nano` tem de expor o tokenizer do motor E o artefato.
+
+    A lista inclui o artefato por modelo de propósito: no 0.1.44 o
+    `EngineTokenizer` chegou, mas `TokenizerArtifact`, `ModelIdentity` e
+    `verify_artifact_matches` continuaram inacessíveis — o binding C++ os
+    expunha e nenhum `__init__`/`tokenize_engine.py` os reexportava. Exportar
+    parte de uma funcionalidade é o mesmo defeito com sintoma menor.
+    """
     wn = pytest.importorskip("winnex_nano")
     faltando = [n for n in ("EngineTokenizer", "EngineTokenizerOptions",
-                            "TokenizerArtifact")
+                            "TokenizerArtifact", "ModelIdentity",
+                            "verify_artifact_matches")
                 if not hasattr(wn, n)]
     assert not faltando, (
         f"o pacote instalado (winnex-nano {getattr(wn, '__version__', '?')}) "
-        f"não expõe {faltando}. O wheel foi construído de um commit anterior "
-        f"ao que adiciona o EngineTokenizer — provavelmente a tag aponta para "
-        f"antes do commit. Verifique `git describe --tags` e recrie a tag.")
+        f"não expõe {faltando}. Ou o wheel foi construído de um commit "
+        f"anterior ao que adiciona a funcionalidade (verifique "
+        f"`git describe --tags`), ou o símbolo existe no binding C++ mas não "
+        f"é reexportado pelo Python — nos dois casos o usuário não o alcança.")
 
 
 def test_modulo_tokenize_engine_importavel():
