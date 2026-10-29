@@ -63,6 +63,23 @@ public:
      *                        token que o modelo esperaria naquela posição
      *   lambda — regularização ridge. 0 = mínimos quadrados puros (instável se
      *            n <= d_in); valores típicos 1e-3 a 1e1 dependendo da escala.
+     *
+     *            O default é 3.0, NÃO 1e-2 (2026-10-29). Medido com o caso de
+     *            uso real — semântica MiniLM (384d) → hidden do Qwen 0.5B
+     *            (896d), 147 textos clínicos, split 80/20:
+     *
+     *              lambda   R² treino   cos TESTE (texto não visto)
+     *              0.00       1.0000       0.1166   (decora)
+     *              0.01       0.9990       0.6209   (default antigo)
+     *              0.50       0.9457       0.7237
+     *              3.00       0.8392       0.7495   <- default novo
+     *              10.0       0.7713       0.7409
+     *
+     *            A ponte é usada com n << d_in (poucos textos, muitas
+     *            dimensões). Nesse regime o ridge SEM regularização
+     *            suficiente decora o treino e não generaliza — o R² de treino
+     *            de 0,999 do default antigo é o sintoma, não a qualidade.
+     *            Quem tem muitos dados pode baixar o lambda explicitamente.
      *   kernel — Linear ou Rbf
      *   n_centers — só para Rbf: número de centros (k-means leve sobre X)
      *
@@ -71,7 +88,7 @@ public:
      * produz saída plausível e errada, então a validação é no ajuste.
      */
     void fit(const float* X, const float* Y, int n, int d_in, int d_out,
-             double lambda = 1e-2,
+             double lambda = 3.0,
              Kernel kernel = Kernel::Linear,
              int n_centers = 0);
 
@@ -89,7 +106,7 @@ public:
         const std::vector<float>& targets,      // [n, d_out], row-major
         int d_in, int d_out,
         void (*encode)(const std::string&, float*, void*), void* encode_ctx,
-        double lambda = 1e-2,
+        double lambda = 3.0,
         Kernel kernel = Kernel::Linear,
         int n_centers = 0);
 
@@ -125,7 +142,7 @@ private:
     bool fitted_ = false;
     Kernel kernel_ = Kernel::Linear;
     int d_in_ = 0, d_out_ = 0, n_fit_ = 0;
-    double lambda_ = 1e-2;
+    double lambda_ = 3.0;
     double train_rmse_ = 0.0, train_r2_ = 0.0;
 
     // Linear: W [d_in, d_out] row-major, b [d_out].

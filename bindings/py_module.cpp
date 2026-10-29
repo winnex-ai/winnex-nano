@@ -657,7 +657,7 @@ PYBIND11_MODULE(_winnex_nano, m) {
                      (int)ix.shape[0], (int)ix.shape[1], (int)iy.shape[1],
                      lambda, k, n_centers);
             return py::make_tuple(self.train_rmse(), self.train_r2());
-        }, py::arg("X"), py::arg("Y"), py::arg("lambda") = 1e-2,
+        }, py::arg("X"), py::arg("Y"), py::arg("lambda") = 3.0,
            py::arg("kernel") = "linear", py::arg("n_centers") = 0,
            "Ajusta a ponte. Devolve (rmse, r2) de treino.")
         .def("apply", [](const EmbedBridge& self,
