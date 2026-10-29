@@ -52,6 +52,13 @@ from ._winnex_nano import (
 
 # Mathematical model fusion / conversion (replaces the refuted W·P projection).
 from . import model_fusion
+from .tokenize_engine import (
+    EngineTokenizer,
+    EngineTokenizerOptions,
+    EngineTokenizeReport,
+    TokenAttribution,
+    SegmentationReport,
+)
 from .model_fusion import (
     linear_merge,
     slerp_merge,
@@ -95,6 +102,11 @@ __all__ = [
     "load_config",
     "compiled_with_simd",
     "EmbedBridge",
+    "EngineTokenizer",
+    "EngineTokenizerOptions",
+    "EngineTokenizeReport",
+    "TokenAttribution",
+    "SegmentationReport",
     "linear_merge",
     "slerp_merge",
     "ties_merge",

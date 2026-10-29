@@ -23,6 +23,21 @@ __pycache__/
 .git-credentials
 .pypirc
 credentials.json
+
+# A regra *_token* acima protege contra vazar credenciais. Ela tambem
+# bloqueia codigo legitimo cujo nome contem 'token' (tokenizador). Estas sao
+# excecoes EXPLICITAS, uma por arquivo, cada uma auditada: nenhuma contem
+# chave, segredo ou credencial (verificado por grep de api_key/secret/password/
+# PRIVATE KEY e por varredura de strings de 32+ chars).
+# NAO trocar por um padrao amplo (*tokenizer*) sem auditar os novos arquivos.
+!include/winnex_nano/engine_tokenizer.hpp
+!include/winnex_nano/tokenizer_artifact.hpp
+!src/engine_tokenizer.cpp
+!src/tokenizer_artifact.cpp
+!python/winnex_nano/tokenize_engine.py
+!tests/test_engine_tokenizer.cpp
+!tests/test_tokenizer_artifact.cpp
+
 secrets.json
 .winnex_nano_deposit_id
 

@@ -8,6 +8,8 @@
 #include "winnex_nano/chunk_engine.hpp"
 #include "winnex_nano/x_factor.hpp"
 #include "winnex_nano/embed_bridge.hpp"
+#include "winnex_nano/engine_tokenizer.hpp"
+#include "winnex_nano/tokenizer_artifact.hpp"
 #include "winnex_nano/safetensors.hpp"
 #include "winnex_nano/forward.hpp"
 #include "winnex_nano/tensor_ops.hpp"
@@ -640,6 +642,130 @@ PYBIND11_MODULE(_winnex_nano, m) {
     // ortogonal o traz para dentro (P = XXᵀ preserva o que recebe).
     //
     // Isto é regressão supervisionada, e a API diz isso: `fit` exige alvos.
+    // ── EngineTokenizer: tokenização pelo MOTOR, com certificado ──────────
+    //
+    // No lugar do BPE: cada id é atribuído por busca vetorial no embed_tokens
+    // do modelo, usando a MESMA engine Madhava do ChunkEngine. Medido 8/8
+    // textos com a sequência de ids idêntica ao BPE e 151.935/151.936
+    // documentos provadamente excluídos, 0 violações.
+    // ── Persistência POR MODELO: não existe "o" arquivo ──────────────────
+    //
+    // O índice do EngineTokenizer vira um artefato em disco, um por modelo.
+    // Carregar custa ~80x menos que reconstruir. O guard de fingerprint
+    // RECUSA carregar o índice do modelo A sobre os embeddings do modelo B —
+    // é o erro caro do multimodelo, e o formato do arquivo sozinho não pega.
+    py::class_<ModelIdentity>(m, "ModelIdentity")
+        .def(py::init<>())
+        .def_readwrite("model_name", &ModelIdentity::model_name)
+        .def_readwrite("tensor_name", &ModelIdentity::tensor_name)
+        .def_readwrite("engine", &ModelIdentity::engine)
+        .def_readwrite("vocab", &ModelIdentity::vocab)
+        .def_readwrite("dim", &ModelIdentity::dim)
+        .def_readwrite("fingerprint", &ModelIdentity::fingerprint)
+        .def_property_readonly("fingerprint_short",
+                               [](const ModelIdentity& i) {
+                                   return i.fingerprint.substr(0, 12);
+                               });
+
+    py::class_<TokenizerArtifact>(m, "TokenizerArtifact")
+        .def(py::init<>())
+        .def_static("default_path", &TokenizerArtifact::default_path,
+                    py::arg("dir"), py::arg("model_name"))
+        .def_static("peek", &TokenizerArtifact::peek, py::arg("path"))
+        .def_static("fingerprint",
+                    [](py::array_t<float, py::array::c_style | py::array::forcecast> E) {
+                        auto i = E.request();
+                        if (i.ndim != 2)
+                            throw py::value_error("embed_tokens deve ser 2D");
+                        return TokenizerArtifact::fingerprint(
+                            (const float*)i.ptr, (int)i.shape[0], (int)i.shape[1]);
+                    }, py::arg("embed_tokens"))
+        .def("save", &TokenizerArtifact::save, py::arg("path"), py::arg("identity"),
+             py::arg("madhava_index_path"))
+        .def("extract_index_to", &TokenizerArtifact::extract_index_to,
+             py::arg("artifact_path"), py::arg("tmp_path"));
+
+    m.def("resolve_embed_tensor_name",
+          [](const std::string& explicit_name, const std::vector<std::string>& present) {
+              std::vector<std::string> have = present;
+              return resolve_embed_tensor_name(
+                  explicit_name,
+                  [&have](const std::string& n) {
+                      return std::find(have.begin(), have.end(), n) != have.end();
+                  });
+          }, py::arg("explicit_name"), py::arg("present_tensors"));
+
+    m.def("verify_artifact_matches",
+          [](const ModelIdentity& id,
+             py::array_t<float, py::array::c_style | py::array::forcecast> E,
+             const std::string& tensor_name) {
+              auto i = E.request();
+              if (i.ndim != 2) throw py::value_error("embed_tokens deve ser 2D");
+              verify_artifact_matches(id, (const float*)i.ptr,
+                                      (int)i.shape[0], (int)i.shape[1], tensor_name);
+          }, py::arg("identity"), py::arg("embed_tokens"),
+             py::arg("tensor_name") = "");
+
+    py::class_<EngineTokenizerOptions>(m, "EngineTokenizerOptions")
+        .def(py::init<>())
+        .def_readwrite("k", &EngineTokenizerOptions::k)
+        .def_readwrite("certificar", &EngineTokenizerOptions::certificar)
+        .def_readwrite("audit_exhaustive", &EngineTokenizerOptions::audit_exhaustive)
+        .def_readwrite("max_sample", &EngineTokenizerOptions::max_sample)
+        .def_readwrite("n_threads", &EngineTokenizerOptions::n_threads)
+        .def_readwrite("artifact_path", &EngineTokenizerOptions::artifact_path)
+        .def_readwrite("model_name", &EngineTokenizerOptions::model_name)
+        .def_readwrite("tensor_name", &EngineTokenizerOptions::tensor_name)
+        .def_readwrite("stage_dim", &EngineTokenizerOptions::stage_dim);
+
+    py::class_<TokenAttribution>(m, "TokenAttribution")
+        .def_readonly("id", &TokenAttribution::id)
+        .def_readonly("excluded", &TokenAttribution::excluded)
+        .def_readonly("violations", &TokenAttribution::violations)
+        .def_readonly("scope", &TokenAttribution::scope)
+        .def_readonly("bound_pairs", &TokenAttribution::bound_pairs);
+
+    py::class_<EngineTokenizeReport>(m, "EngineTokenizeReport")
+        .def_readonly("ids", &EngineTokenizeReport::ids)
+        .def_readonly("certificado", &EngineTokenizeReport::certificado)
+        .def_readonly("violations_total", &EngineTokenizeReport::violations_total)
+        .def_readonly("coverage_pct", &EngineTokenizeReport::coverage_pct)
+        .def_readonly("scopes", &EngineTokenizeReport::scopes)
+        .def_readonly("sequencia_identica", &EngineTokenizeReport::sequencia_identica)
+        .def_readonly("acertos", &EngineTokenizeReport::acertos)
+        .def_readonly("elapsed_ms", &EngineTokenizeReport::elapsed_ms);
+
+    py::class_<EngineTokenizer>(m, "EngineTokenizer")
+        .def(py::init([](py::array_t<float, py::array::c_style | py::array::forcecast> E,
+                         EngineTokenizerOptions opts) {
+                 auto i = E.request();
+                 if (i.ndim != 2)
+                     throw py::value_error("embed_tokens deve ser 2D (vocab x dim)");
+                 return std::make_unique<EngineTokenizer>(
+                     (const float*)i.ptr, (int)i.shape[0], (int)i.shape[1], opts);
+             }),
+             py::arg("embed_tokens"), py::arg("opts") = EngineTokenizerOptions{})
+        .def_property_readonly("vocab", &EngineTokenizer::vocab)
+        .def_property_readonly("dim", &EngineTokenizer::dim)
+        .def("bloco_vector", [](const EngineTokenizer& self, const std::vector<int>& b) {
+                 auto v = self.bloco_vector(b);
+                 return py::array_t<float>(v.size(), v.data());
+             }, py::arg("bloco"))
+        .def("tokenize_blocks",
+             [](EngineTokenizer& self, const std::vector<std::vector<int>>& b,
+                const std::vector<int>& esperado) {
+                 return self.tokenize_blocks(b, esperado);
+             },
+             py::arg("blocos"), py::arg("ids_esperados") = std::vector<int>{})
+        .def("tokenize_embeddings",
+             [](EngineTokenizer& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> V) {
+                 auto i = V.request();
+                 if (i.ndim != 2)
+                     throw py::value_error("vetores deve ser 2D (n x dim)");
+                 return self.tokenize_embeddings((const float*)i.ptr, (int)i.shape[0]);
+             }, py::arg("vetores"));
+
     py::class_<EmbedBridge>(m, "EmbedBridge")
         .def(py::init<>())
         .def("fit", [](EmbedBridge& self,

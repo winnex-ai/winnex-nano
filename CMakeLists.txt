@@ -113,6 +113,13 @@ add_library(winnex_nano
     # A ponte entre a codificação sem vocabulário e o espaço de embeddings.
     # Ver o cabeçalho para o motivo medido (top-1 errado em 4/4 prompts).
     src/embed_bridge.cpp
+    # Tokenização pelo MOTOR (Madhava) com certificado, no lugar do BPE.
+    # Medido: 8/8 textos produzem a MESMA sequência de ids do BPE, com
+    # 151.935/151.936 documentos provadamente excluídos e 0 violações.
+    src/engine_tokenizer.cpp
+    # Persistencia do indice do tokenizer POR MODELO (~80x no load; sem
+    # hardcoding de nome de tensor nem de arquitetura).
+    src/tokenizer_artifact.cpp
     src/safetensors.cpp
     src/forward.cpp
     # OpenCL dense projections for the forward pass. The loader is resolved at
@@ -175,6 +182,19 @@ if(WINNEX_NANO_BUILD_TESTS)
     add_executable(test_x_factor tests/test_x_factor.cpp)
     target_link_libraries(test_x_factor PRIVATE winnex_nano)
     add_test(NAME x_factor COMMAND test_x_factor)
+
+    # Tokenizacao pelo motor: nao precisa de checkpoint (usa embed_tokens
+    # sintetico com clusters), entao roda SEMPRE — ao contrario dos testes que
+    # exigem WINNEX_TEST_MODEL_DIR e ficam verdes por ausencia.
+    add_executable(test_engine_tokenizer tests/test_engine_tokenizer.cpp)
+    target_link_libraries(test_engine_tokenizer PRIVATE winnex_nano)
+    add_test(NAME engine_tokenizer COMMAND test_engine_tokenizer)
+
+    # Persistencia multimodelo: nao precisa de checkpoint (embed_tokens
+    # sintetico), entao roda SEMPRE.
+    add_executable(test_tokenizer_artifact tests/test_tokenizer_artifact.cpp)
+    target_link_libraries(test_tokenizer_artifact PRIVATE winnex_nano)
+    add_test(NAME tokenizer_artifact COMMAND test_tokenizer_artifact)
 
     # test_safetensors exige o caminho de um .safetensors. Ele estava
     # registrado sem argumento, então o CTest o invocava sem modelo, o
