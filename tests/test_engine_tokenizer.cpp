@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -261,6 +262,66 @@ int main() {
         EngineTokenizeReport ra = a.tokenize_blocks({{13, 45}, {77}, {101, 133}});
         EngineTokenizeReport rb = b.tokenize_blocks({{13, 45}, {77}, {101, 133}});
         check(ra.ids == rb.ids, "duas instancias -> mesma sequencia de ids");
+    }
+
+    // ── 11. artefato: a ordem de carga NAO pode mudar o resultado ─────────
+    //
+    // REGRESSAO MEDIDA (2026-10-30, Qwen3-4B, V=151.936, d=2560).
+    //
+    // O caminho quente chamava build_float32 ANTES de load_index, refazendo o
+    // trabalho que o artefato traz pronto (build 7.4 s, load 0.04 s). Inverter
+    // a ordem resolve — mas a primeira tentativa deixou corpus_f32_ = nullptr,
+    // e entao exact_score() caiu no ramo uint8, que e' um espaco COM PERDA:
+    // 16 de 40 consultas trocaram as posicoes 2..k do top-5 (so' o top-1
+    // coincidia, porque a query e' o proprio vetor).
+    //
+    // Corrigir a ORDEM e corrigir a EXATIDAO sao duas exigencias: um ganho que
+    // muda os ids nao e' ganho, e' outro software. Este teste cobra as duas de
+    // uma vez — se alguem "otimizar" o attach de novo largando o corpus float32,
+    // cai aqui.
+    {
+        const char* art = "test_engine_tokenizer.tmp.wnnxtok";
+        std::remove(art);
+
+        EngineTokenizerOptions o;
+        o.artifact_path = art;
+        o.model_name = "sintetico";
+        o.tensor_name = "embed_tokens";
+
+        // BLOCOS-MEDIA, NAO BLOCOS DE 1 ID.
+        //
+        // Medido: com blocos de 1 id este teste passava MESMO com o defeito
+        // presente — a query e' o proprio embedding, o cos e' ~1 e o top-1
+        // coincide nos dois espacos. O defeito vive nas posicoes 2..k, que so'
+        // se disputam quando a query e' AMBIGUA. Um bloco de 2 ids de clusters
+        // DIFERENTES produz exatamente isso: a media cai na fronteira entre
+        // clusters, onde a perda da quantizacao uint8 decide o vencedor.
+        //
+        // Era o caso do corpus real: 16 de 40 consultas divergiam, e nenhuma
+        // delas era um id isolado.
+        std::vector<std::vector<int>> blocos;
+        for (int k = 0; k < K - 1; ++k)
+            blocos.push_back({k, (k + 1) % K + K});   // um id de cada cluster
+
+        // a fria constroi E grava o artefato
+        std::vector<int> ids_frio;
+        {
+            EngineTokenizer frio(E.data(), V, D, o);
+            ids_frio = frio.tokenize_blocks(blocos).ids;
+        }
+        bool criou = std::ifstream(art).good();
+
+        // a quente CARREGA o artefato: mesmos ids, e mais rapida
+        std::vector<int> ids_quente;
+        {
+            EngineTokenizer quente(E.data(), V, D, o);
+            ids_quente = quente.tokenize_blocks(blocos).ids;
+        }
+
+        check(criou, "artefato e' gravado na primeira construcao");
+        check(ids_frio == ids_quente,
+              "artefato (load_index) reproduz os MESMOS ids do build");
+        std::remove(art);
     }
 
     if (failures == 0) {

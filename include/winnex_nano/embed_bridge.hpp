@@ -48,6 +48,32 @@ namespace winnex_nano {
  * `linear` resolve quando o mapa é aproximadamente linear; `rbf` quando não é.
  * Em ambos os casos o custo de aplicação é O(d_in · d_out) por token, ou
  * O(n_centers · d_in) + O(n_centers · d_out) no RBF.
+ *
+ * O QUE ESTA CLASSE É
+ * -------------------
+ * Uma ferramenta de ALINHAMENTO DE ESPAÇO VETORIAL para fins de
+ * COMPATIBILIDADE: leva um vetor do espaço A para o espaço B quando os dois já
+ * descrevem o mesmo conteúdo de maneiras compatíveis. O caso de uso é
+ * integração — fazer um vetor calculado pelo motor conversar com um índice
+ * construído por outro modelo, sem reindexar o corpus.
+ *
+ * O QUE ESTA CLASSE NÃO É
+ * -----------------------
+ * Não é — e não substitui — um codificador semântico treinado. Ela não aprende
+ * significado: ajusta uma regressão supervisionada entre duas representações
+ * que já existem. Se a origem não carrega o sinal, a ponte não o cria; ela
+ * apenas move a fronteira de onde o sinal já estava.
+ *
+ * Isso é medido, não suposto. Com o tokenizer espectral como origem
+ * (encode_hrr_complex, χⱼ(b)=e^{i2πjb/256}, linear, posto 128 — preserva a
+ * estrutura ADITIVA dos bytes, não o significado), o cos de holdout é ~0.12
+ * contra ~0.00 do acaso: acima do acaso, e muito abaixo de "alinhar os
+ * espaços". Um R² de treino baixo sobre essa origem é o resultado ESPERADO,
+ * não um defeito a corrigir com mais treino ou menos regularização.
+ *
+ * Portanto: o caminho de recuperação usa o ENCODER TREINADO, não a ponte. Uma
+ * regressão linear sobre um codificador sem semântica não inventa a informação
+ * que não está lá.
  */
 class EmbedBridge {
 public:

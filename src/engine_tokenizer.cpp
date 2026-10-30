@@ -75,15 +75,39 @@ struct EngineTokenizer::Impl {
         cfg.quant = winnex_madhava::QuantMode::None;
         cfg.normalize_input = true;
         engine = std::make_unique<winnex_madhava::MadhavaL2>(cfg);
-        // O corpus bruto NAO esta no artefato (ele esta no checkpoint): o
-        // chamador re-anexa antes de buscar. E' o contrato do load_index.
-        engine->build_float32(et.data(), vocab);
-        const bool ok = engine->load_index(tmp);
+        // ORDEM: load_index PRIMEIRO, build_float32 so' como fallback.
+        //
+        // Antes desta correcao (2026-10-30), o caminho quente chamava
+        // build_float32 e DEPOIS load_index. build_float32 calcula as
+        // projecoes Stage-1/Stage-2 de TODOS os V vetores — exatamente o
+        // trabalho que o load_index traz pronto do arquivo. O artefato existia,
+        // era lido, e o custo que ele evita era pago de qualquer forma.
+        //
+        // Medido (V=151936, d=2560, rank 128):
+        //     build_float32   7.77 s
+        //     load_index      0.04 s     -> 174x
+        // O EngineTokenizer rendia 1.24x. Era o cache que nunca acerta.
+        //
+        // O corpus bruto NAO esta no artefato (esta no checkpoint), entao ele
+        // precisa ser anexado — mas anexar e' `attach_float32` (quantiza para
+        // uint8 e aponta base_), nao reprojetar.
+        bool ok = false;
+        if (engine->attach_float32(et.data(), vocab)) {
+            ok = engine->load_index(tmp);
+            if (!ok) {
+                // Artefato ilegivel/truncado: reconstroi do zero. O artefato
+                // corrompido NAO pode derrubar o tokenizer — ele e' cache.
+                engine->build_float32(et.data(), vocab);
+                ok = engine->built();
+            }
+        }
         std::remove(tmp.c_str());
         if (!ok) {
+            // Anexar falhou E o rebuild tambem: a engine nao tem corpus valido.
+            // Cair para o build normal (ensure_engine) e' melhor que lancar —
+            // um artefato ruim nao pode impedir a tokenizacao de acontecer.
             engine.reset();
-            throw std::runtime_error(
-                "EngineTokenizer: artefato ilegivel em " + opts.artifact_path);
+            return false;
         }
         loaded_from_artifact = true;
         return true;
