@@ -32,14 +32,25 @@ endif()
 if(NOT EXISTS "${MADHAVA_ROOT}/CMakeLists.txt")
     message(STATUS "winnex-nano: winnex-madhava sources not found locally — fetching from GitHub")
     include(FetchContent)
-    # v1.9.3 e' de agosto e NAO tem as correcoes que destravam macOS e
-    # Windows: flags de SIMD por compilador, OpenMP opcional, e carregamento
-    # dinamico do OpenCL portavel. Fixar numa tag antiga fazia o CI baixar
-    # codigo que nao compila nessas duas plataformas.
+    # v1.9.22 e' o PISO, nao uma escolha estetica.
+    #
+    # engine_tokenizer.cpp chama `MadhavaL2::attach_float32`, que so' existe a
+    # partir desta tag. Com GIT_TAG v1.9.17 — o valor anterior — o build remoto
+    # (todo o CI, e qualquer sdist instalado fora do monorepo) baixava um
+    # header SEM o metodo e falhava no link. Localmente nao falhava porque
+    # MADHAVA_ROOT aponta para ../winnex-madhava, entao o build usava o fonte
+    # da maquina. Resultado: verde na maquina de quem escreveu, vermelho em
+    # todos os alvos do GitHub Actions, sem pista no codigo do nano.
+    #
+    # Historico da linha anterior: v1.9.3 e' de agosto e NAO tem as correcoes
+    # que destravam macOS e Windows (flags de SIMD por compilador, OpenMP
+    # opcional, carregamento dinamico do OpenCL portavel).
+    #
+    # REGRA: ao chamar um metodo novo do Madhava, esta tag sobe junto.
     FetchContent_Declare(
         winnex_madhava_src
         GIT_REPOSITORY https://github.com/winnex-ai/winnex-madhava.git
-        GIT_TAG v1.9.17
+        GIT_TAG v1.9.22
     )
     FetchContent_Populate(winnex_madhava_src)
     set(MADHAVA_ROOT "${winnex_madhava_src_SOURCE_DIR}")
