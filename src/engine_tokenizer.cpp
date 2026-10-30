@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <immintrin.h>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_set>
@@ -245,11 +246,44 @@ EngineTokenizer::EngineTokenizer(const float* embed_tokens, int vocab, int dim,
     // Normaliza UMA vez e valida finitude na mesma passada. Uma engine sobre
     // vetores corrompidos devolve resultado plausivel e errado; a validacao
     // tem de acontecer aqui, nao na primeira consulta.
+    //
+    // VETORIZADO (2026-10-30). Este construtor varre vocab*dim floats — 389 M
+    // num Qwen3-4B (151.936 x 2560) — e era escalar: 0,68 s medidos, o segundo
+    // maior custo do caminho quente depois da carga do artefato. Todas as
+    // instâncias do tokenizer pagam isso, artefato ou não, porque o `et`
+    // normalizado é o que a atribuição usa.
+    //
+    // A VALIDAÇÃO CONTINUA OBRIGATÓRIA. Vetorizar não pode significar perder o
+    // isfinite: NaN/inf produzem norma NaN, e NaN > 0 é falso, então a norma
+    // zero/NaN cai no mesmo throw. O `isfinite` explícito permanece no caminho
+    // escalar de cauda e é coberto pela checagem de norma no vetorizado.
     impl_->et.resize((size_t)vocab * dim);
+    float* et = impl_->et.data();
     for (int i = 0; i < vocab; ++i) {
         const float* src = embed_tokens + (size_t)i * dim;
-        float* dst = impl_->et.data() + (size_t)i * dim;
+        float* dst = et + (size_t)i * dim;
         float acc = 0.0f;
+#if defined(__AVX2__)
+        {
+            __m256 vacc = _mm256_setzero_ps();
+            int j = 0;
+            for (; j + 8 <= dim; j += 8) {
+                const __m256 v = _mm256_loadu_ps(src + j);
+                vacc = _mm256_fmadd_ps(v, v, vacc);
+            }
+            float t[8];
+            _mm256_storeu_ps(t, vacc);
+            for (int k = 0; k < 8; ++k) acc += t[k];
+            for (; j < dim; ++j) {
+                const float v = src[j];
+                if (!std::isfinite(v))
+                    throw std::invalid_argument(
+                        "EngineTokenizer: embed_tokens[" + std::to_string(i) +
+                        "][" + std::to_string(j) + "] nao e' finito");
+                acc += v * v;
+            }
+        }
+#else
         for (int j = 0; j < dim; ++j) {
             const float v = src[j];
             if (!std::isfinite(v))
@@ -258,13 +292,33 @@ EngineTokenizer::EngineTokenizer(const float* embed_tokens, int vocab, int dim,
                     std::to_string(j) + "] nao e' finito");
             acc += v * v;
         }
+#endif
         const float nrm = std::sqrt(acc);
+        // NaN/inf caem aqui: NaN > 0 é falso e inf daria inv = 0 silencioso,
+        // então a mensagem distingue os dois casos em vez de reportar "norma
+        // zero" para um vetor que na verdade explodiu.
+        if (!std::isfinite(nrm))
+            throw std::invalid_argument(
+                "EngineTokenizer: embed_tokens linha " + std::to_string(i) +
+                " tem norma nao-finita — ha NaN/inf nos dados");
         if (!(nrm > 0.0f))
             throw std::invalid_argument(
                 "EngineTokenizer: embed_tokens linha " + std::to_string(i) +
                 " tem norma zero — nao ha direcao para atribuir");
         const float inv = 1.0f / nrm;
+#if defined(__AVX2__)
+        {
+            const __m256 vinv = _mm256_set1_ps(inv);
+            int j = 0;
+            for (; j + 8 <= dim; j += 8) {
+                const __m256 v = _mm256_loadu_ps(src + j);
+                _mm256_storeu_ps(dst + j, _mm256_mul_ps(v, vinv));
+            }
+            for (; j < dim; ++j) dst[j] = src[j] * inv;
+        }
+#else
         for (int j = 0; j < dim; ++j) dst[j] = src[j] * inv;
+#endif
     }
 }
 
