@@ -11,10 +11,20 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <immintrin.h>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_set>
+
+// `immintrin.h` SO' quando ha' AVX2.
+//
+// Incluir incondicionalmente quebrou o build de macOS arm64 (run v0.1.47):
+// no Apple Silicon o CMake nao passa -mavx2, __AVX2__ fica indefinido, mas
+// o header ainda era incluido e o compilador da Apple nao o aceita para
+// arm64. O corpo vetorizado ja' estava sob `#if defined(__AVX2__)`; o
+// include e' que estava fora do guard.
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace winnex_nano {
 
